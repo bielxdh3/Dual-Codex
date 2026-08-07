@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+build/
+dist/
+
+# Local configuration and credentials
+config.toml
+auth.json
+CodexProfiles/
+
+# Runtime artifacts
+runs/*
+!runs/.gitkeep
+*.log
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

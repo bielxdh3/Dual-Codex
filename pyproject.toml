@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dual-codex-orchestrator"
+version = "0.1.2"
+description = "Local orchestrator that coordinates two independently authenticated Codex CLI profiles."
+requires-python = ">=3.11"
+authors = [{ name = "Biel" }]
+dependencies = []
+
+[project.scripts]
+dual-codex = "dual_codex.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

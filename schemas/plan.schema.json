@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "files_to_inspect", "steps", "acceptance_criteria", "risks"],
+  "properties": {
+    "summary": { "type": "string" },
+    "files_to_inspect": { "type": "array", "items": { "type": "string" } },
+    "steps": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+    "risks": { "type": "array", "items": { "type": "string" } }
+  }
+}

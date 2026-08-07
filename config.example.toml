@@ -1,0 +1,20 @@
+# Copy to config.toml and adjust paths.
+
+[orchestrator]
+repository = "E:/path/to/your/repository"
+runs_dir = "runs"
+max_correction_cycles = 1
+require_clean_git = true
+codex_command = "codex"
+
+[architect]
+codex_home = "C:/Users/YOUR_USER/CodexProfiles/architect"
+model = ""
+reasoning_effort = "high"
+sandbox = "read-only"
+
+[executor]
+codex_home = "C:/Users/YOUR_USER/CodexProfiles/executor"
+model = ""
+reasoning_effort = "high"
+sandbox = "workspace-write"

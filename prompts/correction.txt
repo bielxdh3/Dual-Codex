@@ -1,0 +1,15 @@
+You are the implementation agent correcting a reviewed change.
+
+Original task:
+
+{task}
+
+Architect plan:
+
+{plan}
+
+Reviewer findings:
+
+{review}
+
+Fix the blocking and important findings in the repository. Keep changes focused and run relevant validation. Do not commit, push, open a pull request, or modify unrelated files. Return an accurate structured report.
