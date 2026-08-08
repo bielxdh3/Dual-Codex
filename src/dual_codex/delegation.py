@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -16,6 +17,7 @@ from .codex import run_codex_app_server
 from .codex import run_codex_terminal
 from .config import ConfigError, OrchestratorConfig
 from .git import ensure_git_repository, head_revision, status_and_diff, status_porcelain
+from .paths import path_identity_key
 from .process import CommandResult
 from .registry import login_status
 from .report import atomic_write_json, dump_json
@@ -294,13 +296,7 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
-        import ctypes
-
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
-        return ctypes.windll.kernel32.GetLastError() == 5
+        return _windows_pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -312,11 +308,39 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _windows_pid_alive(pid: int) -> bool:
+    """Query a Windows PID without terminating or otherwise affecting it."""
+
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # PROCESS_QUERY_LIMITED_INFORMATION is sufficient and avoids requiring
+    # broad process rights for a lock held by another user.
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+
+    error = ctypes.get_last_error()
+    if error == 5:  # ERROR_ACCESS_DENIED: the process exists but is protected.
+        return True
+    if error in {6, 87, 1168}:  # invalid handle/parameter or process not found.
+        return False
+    # Unknown query failures are treated as live to preserve the lock safety
+    # property; stale locks can still be recovered explicitly.
+    return True
+
+
 class RepositoryLock:
     """A conservative, repository-scoped lock for local executor runs."""
 
     def __init__(self, runs_dir: Path, repository: Path, request_id: str) -> None:
-        digest = hashlib.sha256(str(repository).casefold().encode("utf-8")).hexdigest()[:24]
+        digest = hashlib.sha256(path_identity_key(repository).encode("utf-8")).hexdigest()[:24]
         self.path = runs_dir / ".locks" / f"{digest}.json"
         self.repository = repository
         self.request_id = request_id

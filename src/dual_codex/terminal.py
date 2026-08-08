@@ -14,6 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from .config import AgentConfig, OrchestratorConfig
+from .paths import path_identity_key, same_path
 from .process import codex_environment
 from .report import atomic_write_json
 
@@ -385,7 +386,7 @@ def validate_session_id(value: str) -> str:
 
 
 def session_id_for(account: str, repository: Path) -> str:
-    digest = hashlib.sha256(str(repository.resolve()).casefold().encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha256(path_identity_key(repository).encode("utf-8")).hexdigest()[:12]
     return validate_session_id(f"{account}-{digest}")
 
 
@@ -463,7 +464,6 @@ def _session_files(codex_home: Path) -> list[Path]:
 
 
 def find_session_file(codex_home: Path, repository: Path, *, after: float = 0.0) -> tuple[Path, str] | None:
-    wanted = str(repository.resolve()).replace("/", "\\").casefold()
     match: tuple[Path, float, str] | None = None
     for path in _session_files(codex_home):
         try:
@@ -473,9 +473,9 @@ def find_session_file(codex_home: Path, repository: Path, *, after: float = 0.0)
             with path.open("r", encoding="utf-8", errors="replace") as stream:
                 first = json.loads(stream.readline())
             payload = first.get("payload", first) if isinstance(first, dict) else {}
-            cwd = str(payload.get("cwd", "")).replace("/", "\\").casefold()
+            cwd = str(payload.get("cwd", ""))
             session_id = str(payload.get("session_id") or payload.get("id") or "")
-            if cwd == wanted and session_id and (match is None or stat.st_mtime > match[1]):
+            if same_path(cwd, repository) and session_id and (match is None or stat.st_mtime > match[1]):
                 match = (path, stat.st_mtime, session_id)
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
             continue
@@ -483,7 +483,6 @@ def find_session_file(codex_home: Path, repository: Path, *, after: float = 0.0)
 
 
 def _rollout_records(codex_home: Path, repository: Path) -> list[dict[str, Any]]:
-    wanted = str(repository.resolve()).replace("/", "\\").casefold()
     records: list[dict[str, Any]] = []
     for path in _session_files(codex_home):
         try:
@@ -493,9 +492,9 @@ def _rollout_records(codex_home: Path, repository: Path) -> list[dict[str, Any]]
             payload = first.get("payload", first) if isinstance(first, dict) else {}
             if not isinstance(payload, dict):
                 continue
-            cwd = str(payload.get("cwd", "")).replace("/", "\\").casefold()
+            cwd = str(payload.get("cwd", ""))
             session_id = str(payload.get("session_id") or payload.get("id") or "")
-            if cwd != wanted or not session_id:
+            if not cwd or not same_path(cwd, repository) or not session_id:
                 continue
             records.append(
                 {

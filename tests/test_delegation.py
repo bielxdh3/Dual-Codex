@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 import json
 import hashlib
+import os
 from io import StringIO
 from pathlib import Path
 import subprocess
@@ -16,6 +17,7 @@ from dual_codex.config import load_config
 from dual_codex.delegation import (
     InvalidRequestError,
     RepositoryLock,
+    _pid_alive,
     delegate,
     parse_request,
     run_codex_exec as run_delegation_codex_exec,
@@ -429,6 +431,28 @@ class DelegationTests(unittest.TestCase):
             with patch("dual_codex.delegation._pid_alive", return_value=False):
                 stale.acquire()
             stale.release()
+
+    def test_pid_liveness_recognizes_current_and_dead_processes(self) -> None:
+        self.assertTrue(_pid_alive(os.getpid()))
+        self.assertFalse(_pid_alive(999999))
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-query error semantics are platform-specific")
+    def test_windows_pid_liveness_is_conservative_for_access_and_unknown_errors(self) -> None:
+        with patch("dual_codex.delegation.ctypes.WinDLL") as factory, patch(
+            "dual_codex.delegation.ctypes.get_last_error", return_value=5
+        ):
+            factory.return_value.OpenProcess.return_value = 0
+            self.assertTrue(_pid_alive(12345))
+        with patch("dual_codex.delegation.ctypes.WinDLL") as factory, patch(
+            "dual_codex.delegation.ctypes.get_last_error", return_value=87
+        ):
+            factory.return_value.OpenProcess.return_value = 0
+            self.assertFalse(_pid_alive(12345))
+        with patch("dual_codex.delegation.ctypes.WinDLL") as factory, patch(
+            "dual_codex.delegation.ctypes.get_last_error", return_value=1234
+        ):
+            factory.return_value.OpenProcess.return_value = 0
+            self.assertTrue(_pid_alive(12345))
 
     def test_progress_heartbeat_runs_while_subprocess_is_alive(self) -> None:
         progress: list[str] = []

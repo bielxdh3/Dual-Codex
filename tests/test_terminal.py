@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from dual_codex.config import AgentConfig, OrchestratorConfig
+from dual_codex.paths import same_path
 from dual_codex.terminal import (
     TerminalError,
     TerminalManager,
@@ -75,6 +76,63 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(session_id_for("biel4", same_path_a), session_id_for("biel4", same_path_b))
         self.assertNotEqual(session_id_for("biel4", same_path_a), session_id_for("biel3", same_path_a))
         self.assertNotEqual(session_id_for("biel4", same_path_a), session_id_for("biel4", Path(r"C:\Work Tree\other")))
+
+    def test_distinct_paths_with_spaces_do_not_share_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            left = root / "path with spaces"
+            right = root / "different path"
+            left.mkdir()
+            right.mkdir()
+            self.assertTrue(same_path(left, left.resolve()))
+            self.assertFalse(same_path(left, right))
+
+    @unittest.skipUnless(os.name == "nt", "Windows short-name aliases are platform-specific")
+    def test_short_and_long_windows_paths_share_identity(self) -> None:
+        import ctypes
+
+        with tempfile.TemporaryDirectory(prefix="dual codex ") as temp:
+            long_path = Path(temp).resolve()
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = ctypes.windll.kernel32.GetShortPathNameW(str(long_path), buffer, len(buffer))
+            if not length:
+                self.skipTest("Windows short-name aliases are unavailable")
+            short_path = Path(buffer.value)
+            if short_path == long_path:
+                self.skipTest("Windows volume does not expose a distinct short-name alias")
+            self.assertTrue(same_path(long_path, short_path))
+            self.assertEqual(session_id_for("short", long_path), session_id_for("short", short_path))
+
+            codex_home = long_path / "codex home"
+            session_dir = codex_home / "sessions" / "2026" / "08" / "08"
+            session_dir.mkdir(parents=True)
+            rollout = session_dir / "rollout-short.jsonl"
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"session_id": "short", "cwd": str(short_path)}})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(find_session_file(codex_home, long_path)[1], "short")
+            snapshot = _rollout_snapshot(codex_home, long_path)
+            self.assertIn("short", snapshot)
+
+            rollout.write_text(
+                json.dumps({"type": "session_meta", "payload": {"session_id": "short", "cwd": str(short_path)}})
+                + "\n"
+                + json.dumps({"type": "event_msg", "payload": {"type": "task_started"}})
+                + "\n",
+                encoding="utf-8",
+            )
+            activity = TerminalManager._codex_turn_activity(
+                SimpleNamespace(
+                    codex_home=codex_home,
+                    repository=long_path,
+                    baseline_rollout_mtimes={},
+                    process_started_at=0.0,
+                    codex_session_id="",
+                )
+            )
+            self.assertEqual(activity["source"], "current_epoch")
 
     def test_cosmetic_suggestion_alone_is_not_readiness(self) -> None:
         detector = TuiReadinessDetector()
@@ -406,7 +464,7 @@ class TerminalTests(unittest.TestCase):
             artifact = next(artifact_dir.glob("followup-*.md"))
             self.assertIn(long_message, artifact.read_text(encoding="utf-8"))
             self.assertEqual(evidence["task_transport"], "file")
-            self.assertEqual(evidence["task_artifact"], str(artifact))
+            self.assertTrue(same_path(evidence["task_artifact"], artifact))
 
     def test_control_message_validation_rejects_multiline_empty_oversized_and_task_body(self) -> None:
         with self.assertRaisesRegex(TerminalError, "single physical line"):
