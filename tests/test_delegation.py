@@ -25,6 +25,7 @@ from dual_codex.delegation import (
     TASK_CONTROL_MESSAGE_MAX,
 )
 from dual_codex.cli import main
+from dual_codex.live_events import journal_path, read_journal
 from dual_codex.process import CommandResult, run_command
 from dual_codex.terminal import TERMINAL_INLINE_MESSAGE_MAX, session_id_for
 
@@ -237,6 +238,17 @@ class DelegationTests(unittest.TestCase):
             )
             self.assertIn("[3/5] Starting executor", "\n".join(progress))
             self.assertTrue(Path(result["diff_file"]).exists())
+            events = read_journal(
+                journal_path(
+                    config.runs_dir,
+                    account="executor",
+                    role="executor",
+                    repository=repository,
+                )
+            )
+            self.assertEqual([event.state for event in events[-2:]], ["started", "completed"])
+            self.assertEqual(events[-1].method, "run/completed")
+            self.assertLess(events[-2].sequence, events[-1].sequence)
 
     def test_valid_correct_links_parent_and_includes_findings_and_diff(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

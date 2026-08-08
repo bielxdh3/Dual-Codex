@@ -17,6 +17,7 @@ from .codex import run_codex_app_server
 from .codex import run_codex_terminal
 from .config import ConfigError, OrchestratorConfig
 from .git import ensure_git_repository, head_revision, status_and_diff, status_porcelain
+from .live_events import LiveEventJournal, repository_identity
 from .paths import path_identity_key
 from .process import CommandResult
 from .registry import login_status
@@ -342,22 +343,75 @@ def _windows_pid_alive(pid: int) -> bool:
     return True
 
 
+def _process_start_token(pid: int) -> str | None:
+    """Return a process-creation token when the platform exposes one."""
+
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x0400, False, pid)
+        if not handle:
+            return None
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        try:
+            if not kernel32.GetProcessTimes(handle, ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                return None
+            value = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            return str(value)
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="ascii").rsplit(") ", 1)[-1].split()
+        return fields[19]
+    except (OSError, UnicodeError, IndexError):
+        return None
+
+
+def _safe_process_start_token(pid: int) -> str | None:
+    try:
+        return _process_start_token(pid)
+    except Exception:
+        return None
+
+
 class RepositoryLock:
     """A conservative, repository-scoped lock for local executor runs."""
 
-    def __init__(self, runs_dir: Path, repository: Path, request_id: str) -> None:
+    def __init__(self, runs_dir: Path, repository: Path, request_id: str, run_id: str = "") -> None:
         digest = hashlib.sha256(path_identity_key(repository).encode("utf-8")).hexdigest()[:24]
         self.path = runs_dir / ".locks" / f"{digest}.json"
         self.repository = repository
         self.request_id = request_id
+        self.run_id = run_id
         self._held = False
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "request_id": self.request_id,
+            "run_id": self.run_id,
+            "repository_key": repository_identity(self.repository),
             "repository": str(self.repository),
             "pid": os.getpid(),
+            "process_start": _safe_process_start_token(os.getpid()),
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
         for _ in range(2):
@@ -414,6 +468,31 @@ class RepositoryLock:
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _publish_run_event(
+    journal: LiveEventJournal | None,
+    *,
+    method: str,
+    state: str,
+    detail: Mapping[str, Any],
+    thread_id: str = "",
+    turn_id: str = "",
+) -> None:
+    if journal is None:
+        return
+    try:
+        journal.append(
+            kind="run",
+            state=state,
+            method=method,
+            detail=dict(detail),
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
+    except Exception:
+        # A telemetry failure must not change delegation or repository safety.
+        pass
 
 
 def _request_id_hint(raw_text: str) -> str:
@@ -503,11 +582,18 @@ def _files_from_status(status: str) -> list[str]:
     return files
 
 
-def _run_directory(config: OrchestratorConfig, request: DelegationRequest) -> Path:
+def _run_id(config: OrchestratorConfig, request: DelegationRequest) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    candidate = config.runs_dir / f"{stamp}-{request.request_id}"
+    candidate = f"{stamp}-{request.request_id}"
+    if (config.runs_dir / candidate).exists():
+        candidate = f"{candidate}-{uuid4().hex[:8]}"
+    return candidate
+
+
+def _run_directory(config: OrchestratorConfig, request: DelegationRequest, run_id: str | None = None) -> Path:
+    candidate = config.runs_dir / (run_id or _run_id(config, request))
     if candidate.exists():
-        candidate = config.runs_dir / f"{stamp}-{request.request_id}-{uuid4().hex[:8]}"
+        raise DelegationError(f"Run directory already exists: {candidate}")
     candidate.mkdir(parents=True, exist_ok=False)
     return candidate
 
@@ -873,6 +959,8 @@ def delegate(
     executor_account = ""
     executor_label = ""
     executor_sandbox = ""
+    run_journal: LiveEventJournal | None = None
+    run_id = ""
     try:
         _emit(output, started, "[1/5] Validating request")
         ensure_git_repository(request.repository)
@@ -916,8 +1004,30 @@ def delegate(
                 parent_request_id=request.parent_request_id,
             )
         output(f"Target repository: {request.repository}")
-        with RepositoryLock(config.runs_dir, request.repository, request.request_id):
-            run_dir = _run_directory(config, request)
+        run_id = _run_id(config, request)
+        with RepositoryLock(config.runs_dir, request.repository, request.request_id, run_id):
+            run_dir = _run_directory(config, request, run_id)
+            try:
+                run_journal = LiveEventJournal(
+                    config.runs_dir,
+                    account=executor_account,
+                    role="executor",
+                    repository=request.repository,
+                    run_id=run_id,
+                    request_id=request.request_id,
+                    max_records=config.live_event_journal_max_records,
+                    max_record_bytes=config.live_event_journal_max_record_bytes,
+                    max_detail_bytes=config.live_event_journal_max_detail_bytes,
+                )
+            except (OSError, ValueError):
+                # Observability is best-effort; delegation and its safety gates remain authoritative.
+                run_journal = None
+            _publish_run_event(
+                run_journal,
+                method="run/started",
+                state="started",
+                detail={"request_id": request.request_id, "started_at": started_at},
+            )
             atomic_write_json(run_dir / "request.json", sanitize_value(request.as_dict()))
             initial_diff = _safe_diff(status_and_diff(request.repository)) if request.action == "correct" else ""
             initial_head = head_revision(request.repository)
@@ -975,11 +1085,12 @@ def delegate(
             remaining_issues = _report_list(report or {}, "remaining_issues")
             if head_changed:
                 remaining_issues.append("Git HEAD changed during delegation; inspect the commit manually.")
+            finished_at = _timestamp()
             result = _result(
                 request_id=request.request_id,
                 status=status,
                 started_at=started_at,
-                finished_at=_timestamp(),
+                finished_at=finished_at,
                 summary=summary,
                 executor_account=executor_account,
                 executor_label=executor_label,
@@ -1005,10 +1116,32 @@ def delegate(
                 task_sha256=command_result.metadata.get("task_sha256", task_sha256),
                 error=error,
             )
+            terminal_state = "completed" if status == "completed" else "cancelled" if status == "cancelled" else "failed"
+            _publish_run_event(
+                run_journal,
+                method=f"run/{terminal_state}",
+                state=terminal_state,
+                detail={
+                    "request_id": request.request_id,
+                    "status": status,
+                    "started_at": started_at,
+                    "ended_at": finished_at,
+                    "reason": error or summary,
+                },
+                thread_id=command_result.metadata.get("app_server_thread_id", ""),
+                turn_id=command_result.metadata.get("app_server_turn_id", ""),
+            )
             _emit(output, started, "[5/5] Writing result")
             atomic_write_json(result_file, result)
             return DelegationOutcome(status, request_id, result_file, run_dir, time.monotonic() - started)
     except KeyboardInterrupt:
+        finished_at = _timestamp()
+        _publish_run_event(
+            run_journal,
+            method="run/cancelled",
+            state="cancelled",
+            detail={"request_id": request_id, "started_at": started_at, "ended_at": finished_at, "reason": "Interrupted by user."},
+        )
         return _failed_outcome(
             result_file=result_file,
             request_id=request_id,
@@ -1023,6 +1156,13 @@ def delegate(
             parent_request_id=request.parent_request_id,
         )
     except (ConfigError, DelegationError, OSError, ValueError) as exc:
+        finished_at = _timestamp()
+        _publish_run_event(
+            run_journal,
+            method="run/failed",
+            state="failed",
+            detail={"request_id": request_id, "started_at": started_at, "ended_at": finished_at, "reason": sanitize_text(str(exc))},
+        )
         return _failed_outcome(
             result_file=result_file,
             request_id=request_id,

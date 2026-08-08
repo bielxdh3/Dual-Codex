@@ -40,6 +40,7 @@ class DashboardError(ValueError):
 
 _ACCOUNT_PATH = re.compile(r"^/api/accounts/([A-Za-z0-9][A-Za-z0-9_-]*)(?:/(models|usage|settings))?$")
 _SAFE_HOSTS = {"127.0.0.1", "localhost"}
+LIVE_RECONCILIATION_SECONDS = 10.0
 
 
 def _now() -> str:
@@ -57,11 +58,23 @@ def _error_text(value: Any) -> str:
 
 
 def _live_event_name(value: dict[str, Any]) -> str:
+    if value.get("kind") == "run" and value.get("state") in {"completed", "complete"}:
+        return "complete"
+    if value.get("kind") == "run" and value.get("state") in {"failed", "failure", "cancelled", "canceled"}:
+        return "failed"
     if value.get("kind") == "error" or value.get("state") in {"failed", "error"}:
         return "failed"
     if value.get("kind") == "turn" and value.get("state") in {"completed", "complete"}:
         return "complete"
     return "live"
+
+
+def _live_snapshot_name(snapshot: dict[str, Any]) -> str:
+    return {"COMPLETE": "complete", "FAILED": "failed"}.get(str(snapshot.get("state", "")).upper(), "snapshot")
+
+
+def _live_snapshot_key(snapshot: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(snapshot.get(key) for key in ("state", "run_id", "request_id", "ended_at", "elapsed_seconds", "stale_reason", "last_event_at"))
 
 
 def _agent_for_account(account: Any) -> AgentConfig:
@@ -544,6 +557,7 @@ LIVE_EXECUTOR_SCRIPT = """const EXECUTOR_MAX_ROWS=128;const executorLive={rows:[
 SCRIPT += LIVE_EXECUTOR_SCRIPT
 SCRIPT += """const executorAddEventFromStream=executorAddEvent;executorAddEvent=(value,eventName)=>{const payload=executorObject(value);if((eventName==='complete'||eventName==='failed')&&payload.sequence==null&&payload.cursor!=null&&Array.isArray(payload.events)){executorSetSnapshot(payload);return}executorAddEventFromStream(value,eventName)};"""
 SCRIPT += """const executorTokenAmount=value=>{const direct=executorNumber(value);if(direct!=null)return direct;const object=executorObject(value);for(const key of ['totalTokens','total_tokens','tokens','value']){const amount=executorNumber(object[key]);if(amount!=null)return amount}return null};executorTokenText=value=>{const usage=executorObject(value);const total=executorTokenAmount(usage.totalTokens??usage.total??usage.tokens);const last=executorTokenAmount(usage.lastTokens??usage.last??usage.recent);if(total==null&&last==null)return 'Unknown';const parts=[];if(total!=null)parts.push(`total ${total.toLocaleString()}`);if(last!=null)parts.push(`last ${last.toLocaleString()}`);return parts.join(' · ')};const executorRenderMetaFromSnapshot=executorRenderMeta;executorRenderMeta=()=>{const snapshot=executorLive.snapshot||{};const started=executorDate(snapshot.started_at);const completed=executorDate(snapshot.completed_at);if(started!=null)executorLive.startedAt=started;if(completed!=null)executorLive.endedAt=completed;else if(executorText(snapshot.state,'IDLE').toUpperCase()==='WORKING')executorLive.endedAt=null;executorRenderMetaFromSnapshot()};const executorAddEventWithTimes=executorAddEvent;executorAddEvent=(value,eventName)=>{const event=executorObject(value);if(event.kind==='turn'&&event.state==='started'){executorLive.startedAt=executorDate(event.timestamp);executorLive.endedAt=null;if(executorLive.snapshot)executorLive.snapshot=Object.assign({},executorLive.snapshot,{started_at:event.timestamp,completed_at:null})}executorAddEventWithTimes(value,eventName)};"""
+SCRIPT += """function executorSyncServerTimes(){const snapshot=executorLive.snapshot||{};const state=executorText(snapshot.state,'IDLE').toUpperCase();const started=executorDate(snapshot.started_at);const ended=executorDate(snapshot.ended_at||snapshot.completed_at);if(started!=null)executorLive.startedAt=started;if(state==='WORKING')executorLive.endedAt=null;else if(ended!=null)executorLive.endedAt=ended;else if(executorLive.startedAt!=null&&Number.isFinite(Number(snapshot.elapsed_seconds)))executorLive.endedAt=executorLive.startedAt+Math.max(0,Number(snapshot.elapsed_seconds))*1000}const executorRenderMetaServerTruthBase=executorRenderMeta;executorRenderMeta=()=>{executorSyncServerTimes();executorRenderMetaServerTruthBase();const snapshot=executorLive.snapshot||{};const state=executorText(snapshot.state,'IDLE').toUpperCase();const reason=['STALE','DISCONNECTED'].includes(state)?executorText(snapshot.stale_reason,'Executor activity is no longer live.'):'';const status=document.getElementById('executor-status');if(status)status.textContent=`${state} · ${reason||executorLive.connection}`};const executorSetSnapshotServerTruthBase=executorSetSnapshot;executorSetSnapshot=value=>{executorSetSnapshotServerTruthBase(value);executorSyncServerTimes();executorRenderMeta()};function executorRecordLateEvent(event){const sequence=executorNumber(event.sequence);if(sequence==null||sequence<=executorLive.cursor)return;executorLive.cursor=sequence;executorUpdateMetaFromEvent(event);if(executorLive.clearedAt==null||sequence>executorLive.clearedAt){executorLive.rows.push(event);executorLive.rows=executorLive.rows.slice(-EXECUTOR_MAX_ROWS)}executorLive.snapshot=Object.assign({},executorLive.snapshot||{},{cursor:sequence});executorRender()}const executorAddEventServerTruthBase=executorAddEvent;executorAddEvent=(value,eventName)=>{const event=executorObject(value);const snapshot=executorLive.snapshot||{};const currentState=executorText(snapshot.state,'IDLE').toUpperCase();const sameRun=!event.run_id||!snapshot.run_id||event.run_id===snapshot.run_id;if(['COMPLETE','FAILED','STALE','DISCONNECTED'].includes(currentState)&&sameRun&&event.kind==='turn'&&event.state==='started'){executorRecordLateEvent(event);return}if(event.run_id&&snapshot.run_id&&event.run_id!==snapshot.run_id){executorLive.snapshot=Object.assign({},snapshot,{run_id:event.run_id,request_id:event.request_id||null,state:'IDLE',started_at:null,ended_at:null,completed_at:null,elapsed_seconds:null});executorLive.startedAt=null;executorLive.endedAt=null}executorAddEventServerTruthBase(value,eventName);if(event.kind==='run'&&['completed','complete','failed','failure','cancelled','canceled'].includes(event.state)){const terminalState=['completed','complete'].includes(event.state)?'COMPLETE':'FAILED';const detail=executorObject(event.detail);const ended=executorDate(detail.ended_at)||executorDate(event.timestamp);const started=executorDate(detail.started_at);executorLive.snapshot=Object.assign({},executorLive.snapshot||{},{state:terminalState,started_at:started==null?executorLive.snapshot?.started_at:detail.started_at,ended_at:detail.ended_at||executorLive.snapshot?.ended_at||event.timestamp,completed_at:ended==null?executorLive.snapshot?.completed_at:event.timestamp});if(started!=null)executorLive.startedAt=started;if(ended!=null)executorLive.endedAt=ended}executorSyncServerTimes();executorRenderMeta()};setInterval(()=>{const state=executorText(executorLive.snapshot?.state,'IDLE').toUpperCase();if(state!=='WORKING')executorRenderMeta()},1000);"""
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -619,18 +633,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         try:
-            snapshot_name = {
-                "COMPLETE": "complete",
-                "FAILED": "failed",
-            }.get(snapshot.get("state"), "snapshot")
-            self._sse_event(snapshot_name, cursor, snapshot)
+            self._sse_event(_live_snapshot_name(snapshot), cursor, snapshot)
             last_cursor = cursor
+            last_snapshot = snapshot
             for event in replay:
                 event_id = int(event["sequence"])
                 self._sse_event(_live_event_name(event), event_id, event)
                 last_cursor = max(last_cursor, event_id)
             delay = 0.1
-            heartbeat_at = time.monotonic() + 10
+            heartbeat_at = time.monotonic() + LIVE_RECONCILIATION_SECONDS
             while True:
                 events = reader.events_after(last_cursor)
                 if events:
@@ -638,13 +649,21 @@ class _Handler(BaseHTTPRequestHandler):
                         event_id = int(event["sequence"])
                         self._sse_event(_live_event_name(event), event_id, event)
                         last_cursor = max(last_cursor, event_id)
+                    last_snapshot = reader.snapshot()
                     delay = 0.1
-                    heartbeat_at = time.monotonic() + 10
+                    heartbeat_at = time.monotonic() + LIVE_RECONCILIATION_SECONDS
                     continue
                 if time.monotonic() >= heartbeat_at:
-                    self.wfile.write(b": heartbeat\n\n")
-                    self.wfile.flush()
-                    heartbeat_at = time.monotonic() + 10
+                    current_snapshot = reader.snapshot()
+                    if _live_snapshot_key(current_snapshot) != _live_snapshot_key(last_snapshot):
+                        snapshot_cursor = int(current_snapshot.get("cursor") or last_cursor)
+                        self._sse_event(_live_snapshot_name(current_snapshot), snapshot_cursor, current_snapshot)
+                        last_cursor = max(last_cursor, snapshot_cursor)
+                        last_snapshot = current_snapshot
+                    else:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                    heartbeat_at = time.monotonic() + LIVE_RECONCILIATION_SECONDS
                 time.sleep(delay)
                 delay = min(1.0, delay * 1.5)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):

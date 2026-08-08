@@ -21,6 +21,7 @@ from dual_codex.dashboard import (
     DashboardError,
     DashboardServer,
     DashboardService,
+    _live_event_name,
 )
 from dual_codex.live_events import LiveEventJournal
 
@@ -419,6 +420,104 @@ console.log(JSON.stringify({
             server.httpd.server_close()
             thread.join(timeout=3)
 
+    def test_run_terminal_events_map_to_terminal_sse_names(self) -> None:
+        self.assertEqual(_live_event_name({"kind": "run", "state": "completed"}), "complete")
+        self.assertEqual(_live_event_name({"kind": "run", "state": "failed"}), "failed")
+        self.assertEqual(_live_event_name({"kind": "run", "state": "cancelled"}), "failed")
+
+    def test_live_executor_sse_reconciles_stale_snapshot_without_new_event(self) -> None:
+        class Reader:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def snapshot(self) -> dict:
+                self.calls += 1
+                if self.calls == 1:
+                    return {"state": "WORKING", "cursor": 1, "run_id": "run-1", "events": []}
+                return {
+                    "state": "STALE",
+                    "cursor": 1,
+                    "run_id": "run-1",
+                    "ended_at": "2026-08-08T22:00:00Z",
+                    "elapsed_seconds": 12,
+                    "stale_reason": "active marker has no live writer and no recent activity",
+                    "events": [],
+                }
+
+            def events_after(self, _cursor: int) -> list[dict]:
+                return []
+
+        reader = Reader()
+        server = DashboardServer(self.config)
+        thread = server.serve_in_thread()
+        try:
+            with patch.object(DashboardService, "live_executor_reader", return_value=reader), patch(
+                "dual_codex.dashboard.LIVE_RECONCILIATION_SECONDS", 0.01
+            ):
+                response = urlopen(server.url + "api/live-executor/events", timeout=3)
+                try:
+                    blocks: list[dict[str, str]] = []
+                    current: dict[str, str] = {}
+                    while len(blocks) < 2:
+                        line = response.readline().decode("utf-8")
+                        self.assertTrue(line)
+                        if line == "\n":
+                            blocks.append(current)
+                            current = {}
+                        elif line.startswith("event: "):
+                            current["event"] = line[7:].strip()
+                        elif line.startswith("data: "):
+                            current["data"] = line[6:].strip()
+                    self.assertEqual(blocks[0]["event"], "snapshot")
+                    self.assertEqual(json.loads(blocks[1]["data"])["state"], "STALE")
+                    self.assertIn("stale_reason", blocks[1]["data"])
+                finally:
+                    response.close()
+        finally:
+            server.httpd.shutdown()
+            server.httpd.server_close()
+            thread.join(timeout=3)
+
+    def test_live_executor_reconnect_starts_with_reconciled_terminal_snapshot(self) -> None:
+        journal = LiveEventJournal(
+            self.config.runs_dir,
+            account="secondary",
+            role="executor",
+            repository=self.config.repository,
+            run_id="run-terminal",
+            request_id="request-terminal",
+            max_records=20,
+            max_record_bytes=2048,
+        )
+        journal.append(kind="run", state="started", method="run/started")
+        journal.append(
+            kind="run",
+            state="completed",
+            method="run/completed",
+            detail={"ended_at": "2026-08-08T22:00:00Z"},
+        )
+        server = DashboardServer(self.config)
+        thread = server.serve_in_thread()
+        try:
+            response = urlopen(server.url + "api/live-executor/events", timeout=3)
+            try:
+                block: dict[str, str] = {}
+                while "data" not in block:
+                    line = response.readline().decode("utf-8")
+                    self.assertTrue(line)
+                    if line.startswith("event: "):
+                        block["event"] = line[7:].strip()
+                    elif line.startswith("data: "):
+                        block["data"] = line[6:].strip()
+                self.assertEqual(block["event"], "complete")
+                self.assertEqual(json.loads(block["data"])["state"], "COMPLETE")
+            finally:
+                response.close()
+        finally:
+            server.httpd.shutdown()
+            server.httpd.server_close()
+            thread.join(timeout=3)
+
     def test_live_executor_ui_is_bounded_cli_like_and_text_safe(self) -> None:
         for marker in (
             "EXECUTOR LIVE",
@@ -438,6 +537,20 @@ console.log(JSON.stringify({
         self.assertIn("totalTokens", SCRIPT)
         self.assertIn("started_at", SCRIPT)
         self.assertIn("completed_at", SCRIPT)
+        self.assertIn("ended_at", SCRIPT)
+        self.assertIn("elapsed_seconds", SCRIPT)
+        self.assertIn("stale_reason", SCRIPT)
+        self.assertIn("executorRecordLateEvent", SCRIPT)
+
+    def test_live_executor_script_has_node_syntax_and_server_time_contract(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is required for the frontend syntax regression test")
+        result = subprocess.run([node, "--check"], input=SCRIPT, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("executorLive.clearedAt=executorLive.cursor", SCRIPT)
+        self.assertIn("executorLive.endedAt=null", SCRIPT)
+        self.assertIn("snapshot.elapsed_seconds", SCRIPT)
 
 
 if __name__ == "__main__":
