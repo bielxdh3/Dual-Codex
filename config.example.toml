@@ -1,20 +1,36 @@
-# Copy to config.toml and adjust paths.
+# Copy to config.toml and adjust paths. Account names are local stable keys;
+# labels are display-only and are never used to identify a login.
 
 [orchestrator]
-repository = "E:/path/to/your/repository"
+repository = "C:/Projects/Dual-Codex"
 runs_dir = "runs"
 max_correction_cycles = 1
 require_clean_git = true
 codex_command = "codex"
+node_command = "node"
+terminal_readiness_timeout = 60
+terminal_turn_start_timeout = 15
+app_server_initialize_timeout = 30
+app_server_thread_timeout = 30
+app_server_turn_start_timeout = 30
+app_server_turn_timeout = 600
 
-[architect]
-codex_home = "C:/Users/YOUR_USER/CodexProfiles/architect"
+[accounts.primary]
+label = "Primary account"
+codex_home = "C:/Users/USER/CodexProfiles/architect"
 model = ""
 reasoning_effort = "high"
-sandbox = "read-only"
+backend = "windows"
 
-[executor]
-codex_home = "C:/Users/YOUR_USER/CodexProfiles/executor"
+[accounts.secondary]
+label = "Secondary account"
+codex_home = "C:/Users/USER/CodexProfiles/executor"
 model = ""
 reasoning_effort = "high"
-sandbox = "workspace-write"
+backend = "app_server"
+
+[roles]
+orchestrator = "primary"
+architect = "primary"
+reviewer = "primary"
+executor = "secondary"

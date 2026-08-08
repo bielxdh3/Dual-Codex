@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "request_id", "action", "repository", "task"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "request_id": {"type": "string", "minLength": 1},
+    "action": {"type": "string", "enum": ["implement", "correct"]},
+    "repository": {"type": "string", "minLength": 1},
+    "task": {"type": "string", "minLength": 1},
+    "constraints": {"type": "array", "items": {"type": "string"}},
+    "context_files": {"type": "array", "items": {"type": "string"}},
+    "review_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title", "details"],
+        "properties": {
+          "title": {"type": "string", "minLength": 1},
+          "details": {"type": "string", "minLength": 1},
+          "severity": {"type": "string", "enum": ["blocking", "important", "optional"]}
+        }
+      }
+    },
+    "max_correction_cycles": {"type": "integer", "minimum": 0},
+    "parent_request_id": {"type": "string", "minLength": 1}
+  }
+}

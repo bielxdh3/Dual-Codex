@@ -1,244 +1,321 @@
-<div align="center">
+# Dual Codex Orchestrator — contas, roles e fluxo local
 
-# Dual Codex
-
-**Two Codex accounts. One coordinated development loop.**
-
-[![Status](https://img.shields.io/badge/status-prototype-orange)](#project-status)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
-[![Tests](https://github.com/bielxdh3/Dual-Codex/actions/workflows/tests.yml/badge.svg)](https://github.com/bielxdh3/Dual-Codex/actions/workflows/tests.yml)
-
-A local orchestrator that keeps two independently authenticated Codex CLI profiles in distinct roles: one plans and reviews, while the other implements and tests.
-
-</div>
-
-> [!IMPORTANT]
-> Dual Codex is an early prototype. Test it on a disposable branch or repository before trusting it with important work.
-
-## How it works
+Orquestrador local para coordenar contas Codex autenticadas separadamente. Cada
+conta possui seu proprio `CODEX_HOME`; os roles apenas dizem qual conta executa
+cada parte do fluxo.
 
 ```text
-                         ┌──────────────────────┐
-                         │   Markdown task      │
-                         └──────────┬───────────┘
-                                    │
-                         ┌──────────▼───────────┐
-                         │ Architect account    │
-                         │ plan · read-only     │
-                         └──────────┬───────────┘
-                                    │ plan.json
-                         ┌──────────▼───────────┐
-                         │ Executor account     │
-                         │ edit · test · report │
-                         └──────────┬───────────┘
-                                    │ git diff
-                         ┌──────────▼───────────┐
-                         │ Architect account    │
-                         │ review · read-only   │
-                         └──────┬─────────┬─────┘
-                                │         │
-                         approved     changes requested
-                                │         │
-                                │   ┌─────▼────────────┐
-                                │   │ Executor fixes   │
-                                │   └─────┬────────────┘
-                                └─────────┴──► REPORT.md
+Task → Architect plan → Executor implementation → Reviewer
+                                  ↑                 |
+                                  └── correction ───┘
 ```
 
-The two accounts are isolated with separate `CODEX_HOME` directories. Each run produces structured JSON artifacts, the captured Git diff, and a final Markdown report.
+O projeto nao faz commit, push, PR ou merge. Os artefatos ficam em `runs/` e o
+repositorio pode exigir estado limpo por configuracao.
 
-## Project status
+## Account profile != Role
 
-Version **0.1.2** currently supports:
+Uma conta autenticada e uma coisa; o papel de orquestracao e outra:
 
-- separate Architect and Executor Codex profiles;
-- ChatGPT subscription authentication through Codex CLI;
-- read-only planning and review;
-- workspace-write implementation;
-- JSON Schema-constrained outputs;
-- configurable correction cycles;
-- Git cleanliness checks;
-- run artifacts and final reports;
-- Windows `.CMD` launcher compatibility;
-- visible progress while long Codex turns are running.
+```text
+Account profile:
+biel4 / CodexProfiles/executor / sessao autenticada
 
-It intentionally does **not** create commits, push branches, open pull requests, or merge code yet.
-
-## Requirements
-
-- Windows 10 or 11;
-- Python 3.11 or newer;
-- Git;
-- Node.js/npm or another supported Codex CLI installation method;
-- Codex CLI;
-- two ChatGPT accounts with Codex access that you are authorized to use.
-
-## Quick start
-
-### 1. Install Codex CLI
-
-Using npm:
-
-```powershell
-npm install -g @openai/codex
-codex --version
+Role:
+executor → biel4
 ```
 
-Codex CLI supports signing in with ChatGPT subscriptions. Dual Codex does not require an OpenAI API key for this workflow.
+Uma conta pode ter varios roles, e uma conta sem role continua registrada. O
+role `reviewer` pode ficar sem atribuicao; nesse caso, a revisao usa a conta de
+`architect`. Os roles `architect` e `executor` precisam estar atribuídos para
+executar o fluxo.
 
-### 2. Clone and install Dual Codex
+## Requisitos e instalacao no Windows
+
+- Windows 10 ou 11
+- Python 3.11 ou superior
+- Git
+- Codex CLI instalado e disponivel no PowerShell, inclusive `codex.CMD`
 
 ```powershell
-git clone https://github.com/bielxdh3/Dual-Codex.git
-cd Dual-Codex
-
-py -m venv .venv
-Set-ExecutionPolicy -Scope Process Bypass
+py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
 python -m pip install -e .
-```
-
-If `py` selects Python older than 3.11, install a newer Python version or select it explicitly with the launcher available on your machine.
-
-### 3. Create and authenticate both profiles
-
-```powershell
-.\scripts\setup-profiles.ps1 -BasePath "$HOME\CodexProfiles"
-```
-
-The script opens two browser login flows in sequence:
-
-1. `architect` — planning and review;
-2. `executor` — implementation and tests.
-
-Use the intended ChatGPT account in each browser flow. Profile credentials are stored separately under:
-
-```text
-%USERPROFILE%\CodexProfiles\architect
-%USERPROFILE%\CodexProfiles\executor
-```
-
-> [!CAUTION]
-> Never commit, upload, or share either profile's `auth.json` file.
-
-### 4. Configure the orchestrator
-
-```powershell
 Copy-Item config.example.toml config.toml
 notepad config.toml
 ```
 
-Example:
+Em `config.toml`, ajuste `repository`, os caminhos `codex_home` e o comando do
+Codex. O arquivo local e ignorado pelo Git. Nunca compartilhe `auth.json`.
+
+## Registro de contas
+
+As chaves em `[accounts.<name>]` sao identificadores locais estaveis. `label`
+serve somente para exibicao; nao e usado para descobrir ou autenticar uma conta.
 
 ```toml
-[orchestrator]
-repository = "C:/Users/YOU/Projects/target-repository"
-runs_dir = "runs"
-max_correction_cycles = 1
-require_clean_git = true
-codex_command = "codex"
-
-[architect]
-codex_home = "C:/Users/YOU/CodexProfiles/architect"
+[accounts.primary]
+label = "Primary account"
+codex_home = "C:/Users/USER/CodexProfiles/architect"
 model = ""
 reasoning_effort = "high"
-sandbox = "read-only"
 
-[executor]
-codex_home = "C:/Users/YOU/CodexProfiles/executor"
+[accounts.secondary]
+label = "Secondary account"
+codex_home = "C:/Users/USER/CodexProfiles/executor"
 model = ""
 reasoning_effort = "high"
-sandbox = "workspace-write"
+
+[roles]
+orchestrator = "primary"
+architect = "primary"
+reviewer = "primary"
+executor = "secondary"
 ```
 
-Use forward slashes in Windows TOML paths. Leaving `model = ""` lets each account use its available default model.
+O sandbox e definido pelo role: `architect`/`reviewer` usam `read-only` e
+`executor` usa `workspace-write`. Trocar contas nao troca essas permissoes.
 
-### 5. Run diagnostics
-
-The module form works even when Python's Scripts directory is not on `PATH`:
+Para adicionar uma terceira conta, sem atribuir role automaticamente:
 
 ```powershell
-python -m dual_codex.cli doctor
+dual-codex account add tertiary --label "Terceira conta"
 ```
 
-A healthy setup reports `[OK]` for the Codex executable, version, both profiles, both logins, and the target Git repository.
+O comando cria um `CODEX_HOME` separado, grava seu `config.toml` sem BOM,
+executa o login somente nesse perfil e verifica o status depois. Tambem e
+possivel informar `--codex-home`, `--model`, `--reasoning-effort` e repetir
+`--role` para uma atribuicao explicita.
 
-### 6. Run a task
-
-Edit `task.example.md` or create another Markdown task file:
-
-```powershell
-python -m dual_codex.cli run task.example.md
-```
-
-You will see progress for planning, implementation, review, and any correction cycle. Results are stored in a timestamped directory:
+## Comandos CLI
 
 ```text
-runs/20260807T001613Z/
-├── task.md
-├── plan.json
-├── implementation.json
-├── diff-0.md
-├── review-0.json
-└── REPORT.md
+dual-codex account add [name] [--label LABEL] [--codex-home PATH]
+dual-codex account login NAME [--yes]
+dual-codex account list
+dual-codex account rename OLD-NAME NEW-NAME
+dual-codex account label NAME LABEL
+dual-codex account remove NAME [--delete-profile] [--confirm-delete]
+
+dual-codex role list
+dual-codex role assign ROLE ACCOUNT
+dual-codex role unassign ROLE
+dual-codex role swap ROLE-A ROLE-B
+
+dual-codex status [--json]
+dual-codex doctor
+dual-codex run task.md
+dual-codex delegate --request-file request.json --result-file result.json
 ```
 
-## Git safety
+Exemplos:
 
-By default, `require_clean_git = true`. A run stops when the target repository has uncommitted changes so the executor cannot silently mix new work with existing edits.
+```powershell
+# Ver todas as atribuicoes sem exibir credenciais
+dual-codex status
+dual-codex role list
 
-For a disposable smoke test only, you may set:
+# Mover o trabalho executor para outra conta
+dual-codex role assign executor tertiary
 
-```toml
-require_clean_git = false
+# Trocar Architect e Executor
+dual-codex role swap architect executor
+
+# Alterar somente o nome amigavel, sem novo login
+dual-codex account label tertiary "Conta de testes"
 ```
 
-Return it to `true` before using Dual Codex on real work.
+`account rename` atualiza as referencias de role sem mover o `CODEX_HOME`.
+`account remove` exige que nenhum role use a conta e nao remove o diretorio por
+padrao. Para apagar um perfil, use explicitamente `--delete-profile` e confirme
+quando solicitado.
 
-## Configuration reference
+## Migracao do formato antigo
 
-| Setting | Purpose |
-|---|---|
-| `repository` | Git repository where the agents work |
-| `runs_dir` | Directory containing run artifacts |
-| `max_correction_cycles` | Maximum executor retry rounds after review |
-| `require_clean_git` | Refuse to start with uncommitted changes |
-| `codex_command` | Codex executable name or path |
-| `codex_home` | Isolated profile directory for each account |
-| `model` | Optional explicit model; empty uses the account default |
-| `reasoning_effort` | Codex reasoning effort passed to the run |
-| `sandbox` | Architect uses `read-only`; Executor uses `workspace-write` |
+O formato antigo com `[architect]` e `[executor]` continua sendo lido para
+manter o fluxo funcionando, mas deve ser migrado antes de alterar contas ou
+roles. A migracao nao abre login e nao move, le ou regrava `auth.json`.
 
-## Security model
+Primeiro use um dry run:
 
-- Architect runs with `read-only` access.
-- Executor runs with `workspace-write` access.
-- Credentials stay outside the repository in separate `CODEX_HOME` folders.
-- `config.toml`, `auth.json`, `.venv`, logs, caches, and run outputs are ignored by Git.
-- The prototype never uses `danger-full-access` or bypasses the sandbox.
-- The prototype never commits, pushes, opens PRs, or merges automatically.
+```powershell
+dual-codex migrate-config `
+  --architect-name biel3 `
+  --executor-name biel4 `
+  --architect-label "Conta Architect" `
+  --executor-label "Conta Executor" `
+  --dry-run
+```
 
-## Tests
+Se a pre-visualizacao estiver correta, repita sem `--dry-run`:
+
+```powershell
+dual-codex migrate-config --architect-name biel3 --executor-name biel4 `
+  --architect-label "Conta Architect" --executor-label "Conta Executor"
+```
+
+A migracao cria um backup timestampado de `config.toml`, preserva exatamente os
+caminhos existentes, cria:
+
+```text
+legacy Architect → orchestrator, architect, reviewer
+legacy Executor  → executor
+```
+
+Ela aceita TOML com BOM, grava a nova configuracao sem BOM e e segura para
+repetir: uma configuracao ja migrada nao e duplicada nem sobrescrita.
+
+Para o layout local ja existente, informe os nomes desejados e mantenha os
+diretorios:
+
+```text
+C:/Users/USER/CodexProfiles/architect
+C:/Users/USER/CodexProfiles/executor
+```
+
+Esses caminhos sao apenas exemplos; nao sao hardcoded no aplicativo e devem ser
+substituidos pelos perfis locais de cada maquina.
+
+## Status e seguranca
+
+`dual-codex status` mostra contas, labels, caminhos abreviados, login, roles,
+repositorio ativo, estado do Git, caminho/versao do Codex e configuracao atual.
+Ele nao le `auth.json` para descobrir identidade e nao imprime tokens, conteudo
+de autenticacao ou caminhos completos de credenciais.
+
+O `doctor` verifica executavel, perfis, existencia de login, roles necessarios e
+repositorio. O login de cada conta usa somente seu proprio `CODEX_HOME`.
+
+## Testes
 
 ```powershell
 python -m unittest discover -s tests -v
+python -m compileall -q src
+python -m pip install --no-deps -e .
 ```
 
-GitHub Actions runs the test suite on supported Python versions for every push and pull request.
+Os testes usam diretorios temporarios e placeholders nao secretos. Nenhum teste
+precisa de uma conta Codex real.
 
-## Roadmap
+## Delegacao visivel pelo Codex App
 
-- [ ] Isolated branch/worktree per task
-- [ ] Session persistence and resume
-- [ ] Streaming progress and richer logs
-- [ ] Usage and duration metrics per account
-- [ ] Optional automatic commit
-- [ ] Optional draft pull request
-- [ ] Additional agent adapters
-- [ ] Explicit approval policies for higher-risk actions
+O fluxo recomendado para uso diario deixa o Codex App como interface visivel:
 
-## Disclaimer
+```mermaid
+flowchart LR
+    U[Usuario] --> A[Codex App\norquestrador + architect + reviewer]
+    A --> D[dual-codex delegate]
+    D --> E[Codex App Server JSON-RPC\nconta executor + CODEX_HOME separado]
+    E --> R[resultado JSON + report + Git diff]
+    R --> A
+    A -->|findings concretos| C[correct]
+    C --> E
+```
 
-Dual Codex is an independent community project and is not affiliated with or endorsed by OpenAI. Codex and ChatGPT are trademarks of their respective owner.
+Conta visivel: `Codex App -> orquestrador + architect + reviewer`
+Conta oculta: `Codex CLI -> executor`
+
+Use a frase natural `Use Dual Codex to implement this task.` no App. O App
+inspeciona o repositorio alvo, prepara o pedido JSON, chama o launcher local,
+aguarda `DUAL_CODEX_RESULT`, le o resultado, o report, o estado do Git e o
+diff, e somente entao apresenta a conclusao. O usuario normalmente nao precisa
+abrir o CLI nem criar `task.md`.
+
+O comando principal e:
+
+```powershell
+.\scripts\dual-codex.ps1 --config .\config.toml delegate `
+  --request-file .\request.json --result-file .\result.json
+```
+
+Tambem e possivel usar `--stdin` em vez de `--request-file`. O alvo deve ser
+explicito em `repository` no pedido ou por `--repository`; a opcao de linha de
+comando tem precedencia. Um repositorio sujo e recusado quando
+`require_clean_git = true`; `--allow-dirty` e a excecao explicita.
+
+O App pode consultar o estado sem expor autenticacao:
+
+```powershell
+.\scripts\dual-codex.ps1 --config .\config.toml status --json
+```
+
+## Transporte App Server e fallback TUI
+
+O backend preferencial do executor nativo Windows e `app_server`: Dual Codex
+inicia `codex app-server --stdio` com o `CODEX_HOME` isolado da conta, usa
+JSON-RPC newline-delimited, mantem a associacao repositorio→thread e envia a
+tarefa completa por `turn/start`. O ciclo de trabalho e dirigido por
+`turn/started`/`turn/completed`, sem inferir idle ou atividade pela tela.
+`approvalPolicy = "never"` e usado para o executor `workspace-write`; qualquer
+pedido inesperado de aprovacao e recusado, nunca elevado para
+`danger-full-access`. O processo permanece local em stdio, sem listener de
+rede, e as chaves de API herdadas sao removidas do ambiente filho.
+
+Configure por conta:
+
+```toml
+[accounts.secondary]
+backend = "app_server"
+```
+
+O backend legado `windows` continua disponivel como `native_tui` para
+diagnostico/fallback. Ele preserva ConPTY, `pty-host.js`, named pipe, readiness,
+rollout scoping e os comandos `dual-codex terminal`.
+
+## Terminais Windows persistentes
+
+Para visibilidade e fallback TUI, Dual Codex usa ConPTY por meio de um host
+Node pequeno (`node-pty`). O Python continua sendo o orquestrador. Cada conta
+possui uma sessao independente, `CODEX_HOME`, repositorio, PID e log; o
+controle entre Python e o host usa uma named pipe local, sem servidor de rede.
+O host desativa a integracao opcional `apps` do CLI para nao depender do MCP
+`codex_apps` do Desktop durante uma sessao local.
+
+Instale a dependencia do host uma vez:
+
+```powershell
+npm install
+```
+
+Abra as duas sessoes visiveis em terminais nativos separados:
+
+```powershell
+dual-codex terminal start biel3 --role architect --attach
+dual-codex terminal start biel4 --role executor --attach
+```
+
+Use `dual-codex terminal list`, `send`, `attach` e `terminate` para consultar,
+enviar follow-ups, rever a saida e encerrar sessoes. O fluxo `delegate` reutiliza
+a sessao persistente do executor para manter o contexto entre mensagens. O
+fluxo legado `run` e o fallback para executaveis mockados ainda usam o caminho
+one-shot por compatibilidade; o backend persistente nao usa `codex exec`.
+
+No fluxo persistente, o ConPTY e apenas um canal interativo de controle. O corpo
+de requests `implement`/`correct` fica em um artefato auditavel em
+`runs/executor-task-artifacts`, com SHA-256, e o TUI recebe somente uma mensagem
+curta para ler esse arquivo. Isso evita a representacao `[Pasted Content ...]`
+do composer para tarefas longas; follow-ups curtos continuam inline e follow-ups
+longos usam o mesmo transporte por arquivo. A mensagem de controle e sempre uma
+linha; o texto e o Enter (`\r`) sao enviados separadamente.
+A entrega tambem aguarda um marcador unico `[DC:...]` aparecer no composer
+antes de enviar o Enter; esse acknowledgement tem timeout proprio e nao reenvia
+o controle em caso de falha.
+
+A deteccao de atividade tambem e escopada ao processo ConPTY atual: rollouts
+historicos e inalterados sao registrados como stale e nao bloqueiam uma nova
+readiness, enquanto rollouts criados/atualizados no epoch atual ou associados ao
+mesmo `Codex session_id` continuam bloqueando corretamente.
+
+Arquiteturalmente, a implementacao segue o padrao de runtime-process nativo do
+Agent Orchestrator (processo por sessao e `node-pty`/ConPTY), o conceito de
+Codex como terminal persistente do AWS CLI Agent Orchestrator e o monitoramento
+de sessoes/follow-ups demonstrado pelo codex-orchestrator. Esses projetos sao
+referencias, nao dependencias nem codigo incorporado.
+
+WSL continua sendo o fallback secundario planejado; o runtime Windows nao usa `danger-full-access`,
+`--dangerously-bypass-approvals-and-sandbox`, servidor de rede ou credenciais
+compartilhadas.
+
+Consulte [docs/CLI.md](docs/CLI.md), [docs/APP-INTEGRATION.md](docs/APP-INTEGRATION.md)
+e [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) para os schemas, o fluxo
+de correcoes e a recuperacao de falhas.

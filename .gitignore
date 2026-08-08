@@ -8,10 +8,13 @@ __pycache__/
 .coverage
 build/
 dist/
+node_modules/
 
 # Local configuration and credentials
 config.toml
+config.toml.bak-*
 auth.json
+**/auth.json
 CodexProfiles/
 
 # Runtime artifacts

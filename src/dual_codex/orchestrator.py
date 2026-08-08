@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
 
 from .codex import run_codex_exec
 from .config import OrchestratorConfig
@@ -31,17 +30,7 @@ def _schema(config: OrchestratorConfig, name: str) -> Path:
     return config.project_root / "schemas" / name
 
 
-def _emit(progress: Callable[[str], None] | None, message: str) -> None:
-    if progress is not None:
-        progress(message)
-
-
-def execute(
-    config: OrchestratorConfig,
-    task_file: Path,
-    *,
-    progress: Callable[[str], None] | None = None,
-) -> RunOutcome:
+def execute(config: OrchestratorConfig, task_file: Path) -> RunOutcome:
     task_file = task_file.expanduser().resolve()
     task = _read(task_file).strip()
     if not task:
@@ -59,11 +48,10 @@ def execute(
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "task.md").write_text(task + "\n", encoding="utf-8")
 
-    _emit(progress, "[1/3] Architect is inspecting the repository and creating a plan...")
     plan_path = run_dir / "plan.json"
     run_codex_exec(
         codex_command=config.codex_command,
-        agent=config.architect,
+        agent=config.agent_for_role("architect"),
         repository=config.repository,
         prompt=_prompt(config, "architect.txt", task=task),
         output_path=plan_path,
@@ -71,11 +59,10 @@ def execute(
     )
     plan = load_json(plan_path)
 
-    _emit(progress, "[2/3] Executor is implementing the approved plan and running checks...")
     implementation_path = run_dir / "implementation.json"
     run_codex_exec(
         codex_command=config.codex_command,
-        agent=config.executor,
+        agent=config.agent_for_role("executor"),
         repository=config.repository,
         prompt=_prompt(config, "executor.txt", task=task, plan=dump_json(plan)),
         output_path=implementation_path,
@@ -85,13 +72,12 @@ def execute(
 
     correction_cycles = 0
     while True:
-        _emit(progress, f"[3/3] Architect is reviewing the Git diff (round {correction_cycles + 1})...")
         diff_text = status_and_diff(config.repository)
         (run_dir / f"diff-{correction_cycles}.md").write_text(diff_text, encoding="utf-8")
         review_path = run_dir / f"review-{correction_cycles}.json"
         run_codex_exec(
             codex_command=config.codex_command,
-            agent=config.architect,
+            agent=config.agent_for_role("reviewer"),
             repository=config.repository,
             prompt=_prompt(
                 config,
@@ -106,22 +92,15 @@ def execute(
         )
         review = load_json(review_path)
         if review["verdict"] == "approved":
-            _emit(progress, "Review approved.")
             break
         if correction_cycles >= config.max_correction_cycles:
-            _emit(progress, "Review requested changes, but the correction limit was reached.")
             break
 
         correction_cycles += 1
-        _emit(
-            progress,
-            f"[correction {correction_cycles}/{config.max_correction_cycles}] "
-            "Executor is addressing review findings...",
-        )
         implementation_path = run_dir / f"correction-{correction_cycles}.json"
         run_codex_exec(
             codex_command=config.codex_command,
-            agent=config.executor,
+            agent=config.agent_for_role("executor"),
             repository=config.repository,
             prompt=_prompt(
                 config,

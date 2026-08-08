@@ -1,0 +1,282 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import queue
+import tempfile
+import threading
+import unittest
+from unittest.mock import Mock, patch
+
+from dual_codex.app_server import (
+    AppServerError,
+    _PROCESSES,
+    _normalise_report,
+    _process_key,
+    _sanitize_stderr,
+    run_codex_app_server,
+)
+from dual_codex.config import AgentConfig, OrchestratorConfig
+
+
+class _FakeStdout:
+    def __init__(self) -> None:
+        self.lines: queue.Queue[str | None] = queue.Queue()
+
+    def __iter__(self):
+        while True:
+            line = self.lines.get()
+            if line is None:
+                return
+            yield line
+
+
+class _FakeStdin:
+    def __init__(self, process: "_FakeProcess") -> None:
+        self.process = process
+
+    def write(self, value: str) -> None:
+        for line in value.splitlines():
+            self.process.handle(json.loads(line))
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeProcess:
+    next_pid = 4100
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.pid = _FakeProcess.next_pid
+        _FakeProcess.next_pid += 1
+        self.stdout = _FakeStdout()
+        self.stderr = _FakeStdout()
+        self.stdin = _FakeStdin(self)
+        self.returncode = None
+        self.prompts: list[str] = []
+        self.thread_id = "thread-probe"
+        self.turn_number = 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        self.returncode = 0
+        return 0
+
+    def terminate(self):
+        self.returncode = 0
+        self.stdout.lines.put(None)
+
+    def kill(self):
+        self.terminate()
+
+    def _emit(self, message: dict) -> None:
+        self.stdout.lines.put(json.dumps(message) + "\n")
+
+    def handle(self, message: dict) -> None:
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            self._emit(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "codexHome": "C:/CodexProfiles/executor",
+                        "platformFamily": "windows",
+                        "platformOs": "windows",
+                        "userAgent": "Codex Desktop/test",
+                    },
+                }
+            )
+        elif method == "thread/start":
+            self._emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": self.thread_id}}})
+        elif method == "thread/resume":
+            self._emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": self.thread_id}}})
+        elif method == "turn/start":
+            self.turn_number += 1
+            turn_id = f"turn-{self.turn_number}"
+            text = message["params"]["input"][0]["text"]
+            self.prompts.append(text)
+            report = {
+                "summary": "probe",
+                "files_changed": ["probe.txt"],
+                "commands_run": [],
+                "tests": [],
+                "remaining_issues": [],
+            }
+            self._emit({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": turn_id}}})
+            self._emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"threadId": self.thread_id, "turn": {"id": turn_id}}})
+            self._emit({"jsonrpc": "2.0", "method": "turn/completed", "params": {"threadId": self.thread_id, "turn": {"id": turn_id, "status": "completed", "items": [{"type": "agentMessage", "text": json.dumps(report)}]}}})
+
+
+def _config(root: Path) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        repository=root / "repo",
+        runs_dir=root / "runs",
+        max_correction_cycles=1,
+        require_clean_git=True,
+        codex_command="codex",
+        accounts={},
+        roles={},
+        project_root=root,
+        config_path=root / "config.toml",
+        app_server_turn_timeout=5,
+    )
+
+
+class AppServerTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        for process in list(_PROCESSES.values()):
+            process.close()
+        _PROCESSES.clear()
+
+    def test_structured_turns_reuse_thread_and_clear_api_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            config = _config(root)
+            agent = AgentConfig(
+                codex_home=root / "profile",
+                model="",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="biel4",
+                label="executor",
+                backend="app_server",
+            )
+            fake_processes: list[_FakeProcess] = []
+
+            def create(*args, **kwargs):
+                fake = _FakeProcess(*args, **kwargs)
+                fake_processes.append(fake)
+                self.assertNotIn("OPENAI_API_KEY", kwargs["env"])
+                self.assertNotIn("CODEX_API_KEY", kwargs["env"])
+                return fake
+
+            long_prompt = "x" * 2201
+            with patch.dict("os.environ", {"OPENAI_API_KEY": "secret", "CODEX_API_KEY": "secret"}), patch(
+                "dual_codex.app_server.subprocess.Popen", side_effect=create
+            ):
+                first = run_codex_app_server(
+                    config=config,
+                    agent=agent,
+                    repository=repository,
+                    prompt="short",
+                    output_path=root / "first.json",
+                    session_id="biel4-session",
+                )
+                second = run_codex_app_server(
+                    config=config,
+                    agent=agent,
+                    repository=repository,
+                    prompt=long_prompt,
+                    output_path=root / "second.json",
+                    session_id="biel4-session",
+                )
+
+            self.assertEqual(first.returncode, 0)
+            self.assertEqual(second.returncode, 0)
+            self.assertEqual(first.metadata["app_server_thread_id"], "thread-probe")
+            self.assertEqual(second.metadata["app_server_thread_id"], "thread-probe")
+            self.assertEqual(first.metadata["app_server_turn_id"], "turn-1")
+            self.assertEqual(second.metadata["app_server_turn_id"], "turn-2")
+            self.assertEqual(second.metadata["task_transport"], "app_server")
+            self.assertEqual(len(fake_processes), 1)
+            self.assertEqual(fake_processes[0].prompts, ["short", long_prompt])
+
+    def test_server_requests_are_denied_without_escalation(self) -> None:
+        # The real probe used approvalPolicy=never and emitted no requests. This
+        # unit seam is covered by the implementation's explicit decline branch.
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        sent: list[dict] = []
+        process._send = sent.append
+        process._respond_to_server_request({"id": 7, "method": "item/commandExecution/requestApproval"})
+        self.assertEqual(sent[0]["result"], {"decision": "decline"})
+
+    def test_request_tolerates_an_intermediate_queue_timeout(self) -> None:
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        process._lock = threading.RLock()
+        process._next_id = 0
+        process._send = Mock()
+        process._next_message = Mock(
+            side_effect=[
+                AppServerError("Timed out waiting for App Server JSON-RPC data."),
+                {"jsonrpc": "2.0", "id": 1, "result": {}},
+            ]
+        )
+        response = process.request("thread/start", {}, timeout=1)
+        self.assertEqual(response["id"], 1)
+        self.assertEqual(process._next_message.call_count, 2)
+
+    def test_report_normalisation_keeps_existing_delegation_shape(self) -> None:
+        value = json.loads(
+            _normalise_report(
+                json.dumps(
+                    {
+                        "request_id": "x",
+                        "status": "completed",
+                        "files_changed": ["src/tiny_math/core.py"],
+                        "tests": {"command": "python -m unittest", "result": "passed", "exit_code": 0, "tests_run": 4},
+                        "commit_created": False,
+                    }
+                )
+            )
+        )
+        self.assertEqual(set(value), {"summary", "files_changed", "commands_run", "tests", "remaining_issues"})
+        self.assertEqual(value["tests"][0]["status"], "passed")
+
+    def test_app_server_stderr_is_sanitized_before_result_return(self) -> None:
+        raw = 'auth=C:/Users/USER/.codex/auth.json token="secret-value"'
+        sanitized = _sanitize_stderr(raw)
+        self.assertNotIn("auth.json", sanitized)
+        self.assertNotIn("secret-value", sanitized)
+        self.assertIn("[REDACTED_AUTH_PATH]", sanitized)
+        self.assertIn("[REDACTED]", sanitized)
+
+    def test_failed_turn_discards_persistent_process_without_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            config = _config(root)
+            agent = AgentConfig(
+                codex_home=root / "profile",
+                model="",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="executor",
+                backend="app_server",
+            )
+            process = object.__new__(type("Process", (), {}))
+            process.agent = agent
+            process.config = config
+            process.thread_id_for = Mock(side_effect=AppServerError("turn timed out"))
+            process.close = Mock()
+            key = _process_key(agent, config)
+            _PROCESSES[key] = process
+            with patch("dual_codex.app_server._get_process", return_value=process):
+                result = run_codex_app_server(
+                    config=config,
+                    agent=agent,
+                    repository=repository,
+                    prompt="unsafe to replay",
+                    output_path=root / "result.json",
+                    session_id="session",
+                )
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn(key, _PROCESSES)
+            process.close.assert_called_once_with()
+
+
+if __name__ == "__main__":
+    unittest.main()

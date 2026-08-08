@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "status",
+    "executor_account",
+    "executor_label",
+    "executor_sandbox",
+    "exit_code",
+    "started_at",
+    "finished_at",
+    "summary",
+    "files_changed",
+    "commands_run",
+    "tests",
+    "remaining_issues",
+    "git_status",
+    "diff_file",
+    "run_directory"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "request_id": {"type": "string"},
+    "parent_request_id": {"type": ["string", "null"]},
+    "status": {"type": "string", "enum": ["completed", "failed", "invalid_request", "executor_unavailable", "cancelled"]},
+    "executor_account": {"type": "string"},
+    "executor_label": {"type": "string"},
+    "executor_sandbox": {"type": "string", "enum": ["", "read-only", "workspace-write"]},
+    "exit_code": {"type": ["integer", "null"]},
+    "started_at": {"type": "string"},
+    "finished_at": {"type": "string"},
+    "summary": {"type": "string"},
+    "files_changed": {"type": "array", "items": {"type": "string"}},
+    "commands_run": {"type": "array", "items": {"type": "string"}},
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "status", "details"],
+        "properties": {
+          "command": {"type": "string"},
+          "status": {"type": "string", "enum": ["passed", "failed", "not_run"]},
+          "details": {"type": "string"}
+        }
+      }
+    },
+    "remaining_issues": {"type": "array", "items": {"type": "string"}},
+    "git_status": {"type": "string"},
+    "diff_file": {"type": "string"},
+    "run_directory": {"type": "string"},
+    "executor_report_file": {"type": "string"},
+    "stderr_file": {"type": "string"},
+    "terminal_session_id": {"type": "string"},
+    "terminal_turn_start": {"type": "string"},
+    "task_transport": {"type": "string", "enum": ["", "file", "inline", "app_server"]},
+    "task_artifact": {"type": "string"},
+    "task_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$|^$"},
+    "app_server_thread_id": {"type": "string"},
+    "app_server_turn_id": {"type": "string"},
+    "app_server_process_id": {"type": "string"},
+    "error": {"type": "string"}
+  }
+}

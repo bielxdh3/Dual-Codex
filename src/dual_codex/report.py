@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -15,6 +17,19 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def dump_json(data: dict[str, Any]) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write a JSON object without leaving a partially written result."""
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid4().hex}")
+    try:
+        temporary.write_text(dump_json(data) + "\n", encoding="utf-8", newline="\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def render_markdown(
