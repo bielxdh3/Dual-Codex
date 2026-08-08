@@ -28,6 +28,7 @@ from .registry import (
     swap_roles,
     unassign_role,
 )
+from .dashboard import DashboardServer
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -40,6 +41,10 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true", dest="json_output")
     run = sub.add_parser("run", help="Run architect -> executor -> reviewer")
     run.add_argument("task", help="Markdown task file")
+
+    dashboard = sub.add_parser("dashboard", help="Open the local account control dashboard")
+    dashboard.add_argument("--port", type=int, default=0, help="Loopback port (0 chooses a safe free port)")
+    dashboard.add_argument("--no-open", action="store_true", help="Print the URL without opening a browser")
 
     delegation = sub.add_parser("delegate", help="Delegate one implementation or correction to the executor role")
     request_input = delegation.add_mutually_exclusive_group(required=True)
@@ -176,6 +181,9 @@ def _status_payload(config) -> dict:
                 "codex_home": abbreviate_path(account.codex_home),
                 "login": login_status(config, account),
                 "roles": roles_for_account(config.roles, name),
+                "configured_model": account.model,
+                "configured_reasoning": account.reasoning_effort,
+                "configured_service_tier": account.service_tier,
             }
         )
     try:
@@ -298,6 +306,7 @@ def _account_agent(config, account_name: str, role: str) -> AgentConfig:
         account_name=account.name,
         label=account.label,
         backend=account.backend,
+        service_tier=account.service_tier,
     )
 
 
@@ -329,6 +338,21 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if all(item.ok for item in checks) else 1
         if args.command == "status":
             _show_status(config, json_output=args.json_output)
+            return 0
+        if args.command == "dashboard":
+            if args.port < 0 or args.port > 65535:
+                raise ValueError("Dashboard port must be between 0 and 65535.")
+            server = DashboardServer(config, port=args.port)
+            url = server.start()
+            print(f"Dashboard: {url}", flush=True)
+            if not args.no_open:
+                server.open_browser()
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.shutdown()
             return 0
         if args.command == "terminal":
             manager = TerminalManager(config)

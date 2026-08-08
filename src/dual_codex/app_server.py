@@ -240,11 +240,16 @@ class _AppServerProcess:
         if "method" in message:
             self._events.append(message)
 
-    def request(self, method: str, params: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    def request(self, method: str, params: dict[str, Any] | None, *, timeout: float) -> dict[str, Any]:
         with self._lock:
             self._next_id += 1
             request_id = self._next_id
-            self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+            message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+            if params is not None:
+                message["params"] = params
+            else:
+                message["params"] = None
+            self._send(message)
             deadline = time.monotonic() + timeout
             while True:
                 remaining = deadline - time.monotonic()
@@ -280,6 +285,8 @@ class _AppServerProcess:
         }
         if self.agent.model:
             params["model"] = self.agent.model
+        if self.agent.service_tier:
+            params["serviceTier"] = self.agent.service_tier
         stored = _load_thread_mapping(self.config, self.agent, repository)
         if stored:
             response = self.request(
@@ -315,6 +322,8 @@ class _AppServerProcess:
             params["model"] = self.agent.model
         if self.agent.reasoning_effort:
             params["effort"] = self.agent.reasoning_effort
+        if self.agent.service_tier:
+            params["serviceTier"] = self.agent.service_tier
         response = self.request("turn/start", params, timeout=self.config.app_server_turn_start_timeout)
         if "error" in response:
             raise AppServerError(f"App Server turn/start failed: {_error_message(response)}")
@@ -525,3 +534,55 @@ def run_codex_app_server(
         if process is not None:
             _discard_process(process)
         return CommandResult(command, 1, "", _sanitize_stderr(str(exc)), metadata)
+
+
+def app_server_call(
+    *,
+    config: OrchestratorConfig,
+    agent: AgentConfig,
+    repository: Path,
+    method: str,
+    params: dict[str, Any] | None = None,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Make one bounded, structured read against the account-isolated server.
+
+    The response is deliberately kept as JSON data; callers must select safe
+    fields before returning it from an HTTP endpoint.
+    """
+    process: _AppServerProcess | None = None
+    try:
+        process = _get_process(config, agent, repository, None)
+        response = process.request(
+            method,
+            params,
+            timeout=timeout or config.dashboard_telemetry_timeout,
+        )
+        if "error" in response:
+            return {"error": {"message": _error_message(response)}}
+        result = response.get("result")
+        return result if isinstance(result, dict) else {}
+    except (AppServerError, OSError, ValueError) as exc:
+        if process is not None:
+            _discard_process(process)
+        return {"error": {"message": _json_error(str(exc))}}
+
+
+def app_server_events(
+    *,
+    config: OrchestratorConfig,
+    agent: AgentConfig,
+    repository: Path,
+) -> list[dict[str, Any]]:
+    """Return the in-memory notification tail for a healthy account process."""
+    key = _process_key(agent, config)
+    with _PROCESS_LOCK:
+        process = _PROCESSES.get(key)
+        if process is None or process.process.poll() is not None:
+            return []
+        return process.events
+
+
+def close_app_server_processes() -> None:
+    """Stop dashboard-owned App Server children during a clean shutdown."""
+    _close_processes()

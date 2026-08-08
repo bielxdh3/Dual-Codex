@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Adicionado `dual-codex dashboard`, painel local somente em loopback para
+  contas, roles, backend, modelos, reasoning, service tier/Fast, rate limits,
+  uso e threads persistentes. Valores configurados e efetivos aparecem
+  separados; telemetria ausente permanece `Unknown`/`Not available`.
+- Adicionado `service_tier` opcional à configuração. O valor vazio mantém o
+  comportamento anterior e as alterações do painel gravam atomicamente apenas
+  `config.toml`, sem ler ou regravar credenciais.
+
 ## 0.3.0 - 2026-08-08
 
 - Consolidado o registro generico de contas com atribuicao independente de
