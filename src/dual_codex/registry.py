@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping
 
 from .config import (
     AccountConfig,
@@ -418,6 +418,53 @@ def assign_role(config: OrchestratorConfig, role: str, account_name: str) -> tup
     roles[role] = account_name
     write_registry_config(config.config_path, config.accounts, roles)
     return previous, account_name
+
+
+def _validated_role_map(
+    accounts: Mapping[str, AccountConfig],
+    roles: Mapping[str, str],
+) -> dict[str, str]:
+    validated: dict[str, str] = {}
+    for raw_role, raw_account in roles.items():
+        role = validate_role_name(raw_role)
+        if role in validated:
+            raise ConfigError(f"Duplicate role '{role}'.")
+        account = validate_account_name(raw_account)
+        if account not in accounts:
+            raise ConfigError(f"Role '{role}' refers to unknown account '{account}'.")
+        validated[role] = account
+    return validated
+
+
+def set_roles_for_account(
+    config: OrchestratorConfig,
+    account_name: str,
+    roles: Iterable[str],
+) -> dict[str, str]:
+    """Atomically replace one account's complete role set."""
+    if config.legacy:
+        raise ConfigError("Run 'dual-codex migrate-config' before changing roles.")
+    account_name = validate_account_name(account_name)
+    if account_name not in config.accounts:
+        raise ConfigError(f"Unknown account '{account_name}'.")
+    if isinstance(roles, (str, bytes)):
+        raise ConfigError("roles must be a list of role names.")
+
+    requested: list[str] = []
+    for raw_role in roles:
+        if not isinstance(raw_role, str):
+            raise ConfigError("roles must contain only strings.")
+        role = validate_role_name(raw_role)
+        if role in requested:
+            raise ConfigError(f"Duplicate role '{role}'.")
+        requested.append(role)
+
+    current = _validated_role_map(config.accounts, config.roles)
+    resulting = {role: owner for role, owner in current.items() if owner != account_name}
+    resulting.update({role: account_name for role in requested})
+    resulting = _validated_role_map(config.accounts, resulting)
+    write_registry_config(config.config_path, config.accounts, resulting)
+    return resulting
 
 
 def unassign_role(config: OrchestratorConfig, role: str) -> str | None:

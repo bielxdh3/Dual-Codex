@@ -10,6 +10,12 @@
   comportamento anterior e as alterações do painel gravam atomicamente apenas
   `config.toml`, sem ler ou regravar credenciais.
 
+- Corrigido o painel para reconstruir reasoning e service tier/Fast conforme o
+  modelo selecionado, incluindo o modelo default herdado e avisos para ajustes
+  de valores incompatíveis.
+- Adicionado editor de conjunto de roles por conta, com aplicação atômica,
+  transferência de roles globais e exibição simultânea de múltiplos roles.
+
 ## 0.3.0 - 2026-08-08
 
 - Consolidado o registro generico de contas com atribuicao independente de

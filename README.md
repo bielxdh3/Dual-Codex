@@ -192,6 +192,13 @@ atomicamente para turnos futuros; a thread persistente atual não é alterada
 silenciosamente. Métricas ou métodos não suportados aparecem como `Unknown` ou
 `Not available`.
 
+Os controles de reasoning e service tier/Fast acompanham imediatamente o
+modelo selecionado e usam o modelo anunciado como default quando `model = ""`.
+Opções incompatíveis são ajustadas no formulário com aviso, sem alterar a
+configuração até `Save`. Cada conta também pode manter vários roles; o editor
+por checkboxes aplica o conjunto completo em uma operação atômica e transfere
+roles globais para a conta escolhida quando necessário.
+
 ## Status e seguranca
 
 `dual-codex status` mostra contas, labels, caminhos abreviados, login, roles,
