@@ -60,6 +60,11 @@ executor = "primary"
         with self.assertRaises(ValueError):
             DashboardService(self.config).save_settings("primary", {"scope": "current_thread"})
 
+    def test_role_assignment_api_uses_registry_validation(self) -> None:
+        result = DashboardService(self.config).assign({"role": "executor", "account": "primary"})
+        self.assertEqual(result["account"], "primary")
+        self.assertEqual(load_config(self.config_path).roles["executor"], "primary")
+
     def test_server_smoke_and_security_boundary(self) -> None:
         server = DashboardServer(self.config)
         thread = server.serve_in_thread()
