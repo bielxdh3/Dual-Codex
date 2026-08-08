@@ -2,7 +2,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
+from typing import Any
 import tomllib
+
+
+SUPPORTED_ROLES = ("orchestrator", "architect", "reviewer", "executor")
+SUPPORTED_BACKENDS = ("app_server", "windows")
+_ACCOUNT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_ROLE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+
+
+class ConfigError(ValueError):
+    """Raised when the registry configuration is invalid or incomplete."""
+
+
+@dataclass(frozen=True)
+class AccountConfig:
+    name: str
+    label: str
+    codex_home: Path
+    model: str
+    reasoning_effort: str
+    backend: str = "windows"
 
 
 @dataclass(frozen=True)
@@ -11,6 +33,9 @@ class AgentConfig:
     model: str
     reasoning_effort: str
     sandbox: str
+    account_name: str = ""
+    label: str = ""
+    backend: str = "windows"
 
 
 @dataclass(frozen=True)
@@ -20,38 +45,186 @@ class OrchestratorConfig:
     max_correction_cycles: int
     require_clean_git: bool
     codex_command: str
-    architect: AgentConfig
-    executor: AgentConfig
+    accounts: dict[str, AccountConfig]
+    roles: dict[str, str]
     project_root: Path
+    config_path: Path
+    legacy: bool = False
+    node_command: str = "node"
+    terminal_readiness_timeout: float = 60.0
+    terminal_turn_start_timeout: float = 15.0
+    app_server_initialize_timeout: float = 30.0
+    app_server_thread_timeout: float = 30.0
+    app_server_turn_start_timeout: float = 30.0
+    app_server_turn_timeout: float = 600.0
+
+    @property
+    def architect(self) -> AgentConfig:
+        return self.agent_for_role("architect")
+
+    @property
+    def executor(self) -> AgentConfig:
+        return self.agent_for_role("executor")
+
+    def account_for_role(self, role: str) -> AccountConfig:
+        if role == "reviewer" and role not in self.roles:
+            role = "architect"
+        account_name = self.roles.get(role)
+        if not account_name:
+            raise ConfigError(f"Required role '{role}' is unassigned.")
+        account = self.accounts.get(account_name)
+        if account is None:
+            raise ConfigError(
+                f"Role '{role}' refers to unknown account '{account_name}'."
+            )
+        return account
+
+    def agent_for_role(self, role: str) -> AgentConfig:
+        account = self.account_for_role(role)
+        sandbox = "workspace-write" if role == "executor" else "read-only"
+        return AgentConfig(
+            codex_home=account.codex_home,
+            model=account.model,
+            reasoning_effort=account.reasoning_effort,
+            sandbox=sandbox,
+            account_name=account.name,
+            label=account.label,
+            backend=account.backend,
+        )
 
 
-def _agent(raw: dict, base: Path) -> AgentConfig:
-    home = Path(raw["codex_home"]).expanduser()
-    if not home.is_absolute():
-        home = (base / home).resolve()
-    return AgentConfig(
-        codex_home=home,
+def validate_account_name(name: str) -> str:
+    name = str(name).strip()
+    if not _ACCOUNT_NAME.fullmatch(name):
+        raise ConfigError(
+            "Account names must start with a letter or number and contain "
+            "only letters, numbers, '-' or '_'."
+        )
+    return name
+
+
+def validate_role_name(role: str) -> str:
+    role = str(role).strip()
+    if not _ROLE_NAME.fullmatch(role):
+        raise ConfigError(
+            "Role names must start with a letter and contain only letters, "
+            "numbers or '_'."
+        )
+    if role not in SUPPORTED_ROLES:
+        raise ConfigError(
+            f"Unknown role '{role}'. Supported roles: {', '.join(SUPPORTED_ROLES)}."
+        )
+    return role
+
+
+def _path(raw: Any, base: Path) -> Path:
+    value = Path(str(raw)).expanduser()
+    return value if value.is_absolute() else (base / value).resolve()
+
+
+def _account(name: str, raw: dict[str, Any], base: Path) -> AccountConfig:
+    if "codex_home" not in raw:
+        raise ConfigError(f"Account '{name}' is missing codex_home.")
+    backend = str(raw.get("backend", "windows")).strip() or "windows"
+    if backend not in SUPPORTED_BACKENDS:
+        raise ConfigError(
+            f"Account '{name}' has unsupported backend '{backend}'. "
+            f"Supported backends: {', '.join(SUPPORTED_BACKENDS)}."
+        )
+    return AccountConfig(
+        name=validate_account_name(name),
+        label=str(raw.get("label", "")).strip(),
+        codex_home=_path(raw["codex_home"], base),
         model=str(raw.get("model", "")).strip(),
         reasoning_effort=str(raw.get("reasoning_effort", "high")).strip(),
-        sandbox=str(raw["sandbox"]).strip(),
+        backend=backend,
     )
+
+
+def load_raw_config(path: Path) -> dict[str, Any]:
+    path = path.expanduser().resolve()
+    data = path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    return tomllib.loads(data.decode("utf-8"))
+
+
+def is_legacy_raw(raw: dict[str, Any]) -> bool:
+    return "accounts" not in raw and ("architect" in raw or "executor" in raw)
 
 
 def load_config(path: Path) -> OrchestratorConfig:
     path = path.expanduser().resolve()
-    # utf-8-sig accepts both ordinary UTF-8 and Windows-created UTF-8 files
-    # that contain a byte-order mark.
-    raw = tomllib.loads(path.read_text(encoding="utf-8-sig"))
-
+    raw = load_raw_config(path)
     base = path.parent
-    project_root = Path(__file__).resolve().parents[2]
-    orch = raw["orchestrator"]
-    repository = Path(orch["repository"]).expanduser()
-    if not repository.is_absolute():
-        repository = (base / repository).resolve()
-    runs_dir = Path(orch.get("runs_dir", "runs")).expanduser()
-    if not runs_dir.is_absolute():
-        runs_dir = (base / runs_dir).resolve()
+
+    try:
+        orch = raw["orchestrator"]
+        if not isinstance(orch, dict):
+            raise TypeError
+    except (KeyError, TypeError) as exc:
+        raise ConfigError("Missing [orchestrator] configuration.") from exc
+
+    repository = _path(orch["repository"], base)
+    runs_dir = _path(orch.get("runs_dir", "runs"), base)
+
+    legacy = is_legacy_raw(raw)
+    accounts: dict[str, AccountConfig] = {}
+    if legacy:
+        if "architect" not in raw or "executor" not in raw:
+            raise ConfigError("Legacy config must contain both [architect] and [executor].")
+        for name in ("architect", "executor"):
+            value = raw[name]
+            if not isinstance(value, dict):
+                raise ConfigError(f"Legacy [{name}] section is invalid.")
+            accounts[name] = _account(name, value, base)
+        roles = {
+            "orchestrator": "architect",
+            "architect": "architect",
+            "reviewer": "architect",
+            "executor": "executor",
+        }
+    else:
+        raw_accounts = raw.get("accounts", {})
+        if not isinstance(raw_accounts, dict):
+            raise ConfigError("[accounts] must contain account tables.")
+        for name, value in raw_accounts.items():
+            if not isinstance(value, dict):
+                raise ConfigError(f"Account '{name}' is invalid.")
+            account = _account(str(name), value, base)
+            if account.name in accounts:
+                raise ConfigError(f"Duplicate account '{account.name}'.")
+            accounts[account.name] = account
+
+        raw_roles = raw.get("roles", {})
+        if not isinstance(raw_roles, dict):
+            raise ConfigError("[roles] must contain role assignments.")
+        roles = {
+            str(role): str(account).strip()
+            for role, account in raw_roles.items()
+            if str(account).strip()
+        }
+
+    terminal_readiness_timeout = float(orch.get("terminal_readiness_timeout", 60.0))
+    if terminal_readiness_timeout <= 0:
+        raise ConfigError("terminal_readiness_timeout must be positive.")
+    terminal_turn_start_timeout = float(orch.get("terminal_turn_start_timeout", 15.0))
+    if terminal_turn_start_timeout <= 0:
+        raise ConfigError("terminal_turn_start_timeout must be positive.")
+    app_server_initialize_timeout = float(orch.get("app_server_initialize_timeout", 30.0))
+    app_server_thread_timeout = float(orch.get("app_server_thread_timeout", 30.0))
+    app_server_turn_start_timeout = float(orch.get("app_server_turn_start_timeout", 30.0))
+    app_server_turn_timeout = float(orch.get("app_server_turn_timeout", 600.0))
+    if any(
+        value <= 0
+        for value in (
+            app_server_initialize_timeout,
+            app_server_thread_timeout,
+            app_server_turn_start_timeout,
+            app_server_turn_timeout,
+        )
+    ):
+        raise ConfigError("App Server timeouts must be positive.")
 
     return OrchestratorConfig(
         repository=repository,
@@ -59,7 +232,16 @@ def load_config(path: Path) -> OrchestratorConfig:
         max_correction_cycles=int(orch.get("max_correction_cycles", 1)),
         require_clean_git=bool(orch.get("require_clean_git", True)),
         codex_command=str(orch.get("codex_command", "codex")),
-        architect=_agent(raw["architect"], base),
-        executor=_agent(raw["executor"], base),
-        project_root=project_root,
+        accounts=accounts,
+        roles=roles,
+        project_root=Path(__file__).resolve().parents[2],
+        config_path=path,
+        legacy=legacy,
+        node_command=str(orch.get("node_command", "node")).strip() or "node",
+        terminal_readiness_timeout=terminal_readiness_timeout,
+        terminal_turn_start_timeout=terminal_turn_start_timeout,
+        app_server_initialize_timeout=app_server_initialize_timeout,
+        app_server_thread_timeout=app_server_thread_timeout,
+        app_server_turn_start_timeout=app_server_turn_start_timeout,
+        app_server_turn_timeout=app_server_turn_timeout,
     )

@@ -4,8 +4,8 @@
   "additionalProperties": false,
   "required": ["verdict", "summary", "findings"],
   "properties": {
-    "verdict": { "type": "string", "enum": ["approved", "changes_requested"] },
-    "summary": { "type": "string" },
+    "verdict": {"type": "string", "enum": ["approved", "changes_requested"]},
+    "summary": {"type": "string"},
     "findings": {
       "type": "array",
       "items": {
@@ -13,9 +13,9 @@
         "additionalProperties": false,
         "required": ["severity", "title", "details"],
         "properties": {
-          "severity": { "type": "string", "enum": ["blocking", "important", "optional"] },
-          "title": { "type": "string" },
-          "details": { "type": "string" }
+          "severity": {"type": "string", "enum": ["blocking", "important", "optional"]},
+          "title": {"type": "string"},
+          "details": {"type": "string"}
         }
       }
     }

@@ -15,6 +15,10 @@ def status_porcelain(repository: Path) -> str:
     return run_command(["git", "status", "--porcelain=v1"], cwd=repository).stdout
 
 
+def head_revision(repository: Path) -> str:
+    return run_command(["git", "rev-parse", "HEAD"], cwd=repository).stdout.strip()
+
+
 def status_and_diff(repository: Path) -> str:
     status = run_command(["git", "status", "--short"], cwd=repository).stdout
     unstaged = run_command(["git", "diff", "--no-ext-diff"], cwd=repository).stdout
