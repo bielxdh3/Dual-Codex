@@ -19,10 +19,10 @@ Uma conta autenticada e uma coisa; o papel de orquestracao e outra:
 
 ```text
 Account profile:
-biel4 / CodexProfiles/executor / sessao autenticada
+executor-account / <codex-home>/executor / sessao autenticada
 
 Role:
-executor → biel4
+executor → executor-account
 ```
 
 Uma conta pode ter varios roles, e uma conta sem role continua registrada. O
@@ -56,13 +56,13 @@ serve somente para exibicao; nao e usado para descobrir ou autenticar uma conta.
 ```toml
 [accounts.primary]
 label = "Primary account"
-codex_home = "C:/Users/USER/CodexProfiles/architect"
+codex_home = "<codex-home>/architect"
 model = ""
 reasoning_effort = "high"
 
 [accounts.secondary]
 label = "Secondary account"
-codex_home = "C:/Users/USER/CodexProfiles/executor"
+codex_home = "<codex-home>/executor"
 model = ""
 reasoning_effort = "high"
 
@@ -141,8 +141,8 @@ Primeiro use um dry run:
 
 ```powershell
 dual-codex migrate-config `
-  --architect-name biel3 `
-  --executor-name biel4 `
+  --architect-name architect-account `
+  --executor-name executor-account `
   --architect-label "Conta Architect" `
   --executor-label "Conta Executor" `
   --dry-run
@@ -151,7 +151,7 @@ dual-codex migrate-config `
 Se a pre-visualizacao estiver correta, repita sem `--dry-run`:
 
 ```powershell
-dual-codex migrate-config --architect-name biel3 --executor-name biel4 `
+dual-codex migrate-config --architect-name architect-account --executor-name executor-account `
   --architect-label "Conta Architect" --executor-label "Conta Executor"
 ```
 
@@ -170,8 +170,8 @@ Para o layout local ja existente, informe os nomes desejados e mantenha os
 diretorios:
 
 ```text
-C:/Users/USER/CodexProfiles/architect
-C:/Users/USER/CodexProfiles/executor
+<codex-home>/architect
+<codex-home>/executor
 ```
 
 Esses caminhos sao apenas exemplos; nao sao hardcoded no aplicativo e devem ser
@@ -198,6 +198,30 @@ Opções incompatíveis são ajustadas no formulário com aviso, sem alterar a
 configuração até `Save`. Cada conta também pode manter vários roles; o editor
 por checkboxes aplica o conjunto completo em uma operação atômica e transfere
 roles globais para a conta escolhida quando necessário.
+
+### Live Executor
+
+O painel tambem possui a visao `EXECUTOR LIVE`, baseada nos eventos reais do
+Executor App Server. Ela le um journal JSONL por conta, role e identidade do
+repositorio; nenhum processo Executor falso e criado pelo dashboard. O caminho
+do journal e derivado pelo servidor dentro de `runs_dir`, e o navegador nunca
+envia um caminho de arquivo.
+
+O historico e limitado pelos valores `live_event_journal_max_records`,
+`live_event_journal_max_record_bytes` e `live_event_journal_max_detail_bytes`.
+A visao usa o endpoint SSE somente para leitura, retoma por cursor ou
+`Last-Event-ID`, mantem uma quantidade limitada de linhas no navegador e envia
+heartbeats sem busy loop. `Clear View` remove apenas as linhas renderizadas no
+navegador; nao apaga journal nem historico do servidor.
+
+Antes da persistencia, eventos removem ou redigem segredos, caminhos sensiveis,
+arquivos de autenticacao e campos de reasoning interno. A interface insere
+texto como texto, nao como HTML, e nunca exibe chain-of-thought; reasoning
+visivel significa somente o nivel protocolar anunciado. Commands, output,
+diffs, files e mensagens aparecem apenas quando ha evidencia do protocolo;
+leituras de arquivos nao sao inferidas. O painel continua somente em
+`127.0.0.1`, valida Host/Origin, nao oferece shell interativo nem endpoint de
+filesystem e operacoes GET/SSE nao alteram configuracao ou journal.
 
 ## Status e seguranca
 
@@ -303,8 +327,8 @@ npm install
 Abra as duas sessoes visiveis em terminais nativos separados:
 
 ```powershell
-dual-codex terminal start biel3 --role architect --attach
-dual-codex terminal start biel4 --role executor --attach
+dual-codex terminal start architect-account --role architect --attach
+dual-codex terminal start executor-account --role executor --attach
 ```
 
 Use `dual-codex terminal list`, `send`, `attach` e `terminate` para consultar,

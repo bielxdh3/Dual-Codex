@@ -15,6 +15,9 @@ app_server_thread_timeout = 30
 app_server_turn_start_timeout = 30
 app_server_turn_timeout = 600
 dashboard_telemetry_timeout = 5
+live_event_journal_max_records = 2000
+live_event_journal_max_record_bytes = 65536
+live_event_journal_max_detail_bytes = 16384
 
 [accounts.primary]
 label = "Primary account"

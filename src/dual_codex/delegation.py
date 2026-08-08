@@ -37,6 +37,9 @@ def run_codex_exec(**kwargs):
             agent.account_name,
             kwargs["repository"],
         )
+        app_server_kwargs["request_id"] = kwargs.get("request_id", "")
+        app_server_kwargs["run_id"] = kwargs.get("run_id", app_server_kwargs["session_id"])
+        app_server_kwargs["role"] = kwargs.get("role", "executor")
         return run_codex_app_server(**app_server_kwargs)
     command_name = Path(config.codex_command).stem.casefold() if config else "codex"
     if config is not None and not command_name.startswith("codex"):
@@ -53,6 +56,9 @@ def run_codex_exec(**kwargs):
     terminal_kwargs = dict(kwargs)
     terminal_kwargs.pop("schema_path", None)
     terminal_kwargs.pop("check", None)
+    terminal_kwargs.pop("request_id", None)
+    terminal_kwargs.pop("run_id", None)
+    terminal_kwargs.pop("role", None)
     from .terminal import session_id_for
 
     terminal_kwargs["session_id"] = session_id_for(
@@ -937,6 +943,9 @@ def delegate(
                 check=False,
                 task_artifact_path=task_artifact,
                 task_sha256=task_sha256,
+                request_id=request.request_id,
+                run_id=run_dir.name,
+                role="executor",
                 progress=lambda message: _emit(output, started, f"[3/5] {message}"),
             )
             stdout_path = run_dir / "executor.stdout.log"

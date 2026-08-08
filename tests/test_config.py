@@ -19,6 +19,9 @@ runs_dir = "runs"
 max_correction_cycles = 2
 require_clean_git = true
 codex_command = "codex"
+live_event_journal_max_records = 9
+live_event_journal_max_record_bytes = 2048
+live_event_journal_max_detail_bytes = 512
 
 [architect]
 codex_home = "profiles/a"
@@ -40,6 +43,9 @@ sandbox = "workspace-write"
             self.assertEqual(config.max_correction_cycles, 2)
             self.assertEqual(config.architect.sandbox, "read-only")
             self.assertEqual(config.executor.sandbox, "workspace-write")
+            self.assertEqual(config.live_event_journal_max_records, 9)
+            self.assertEqual(config.live_event_journal_max_record_bytes, 2048)
+            self.assertEqual(config.live_event_journal_max_detail_bytes, 512)
 
     def test_rejects_unknown_backend(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

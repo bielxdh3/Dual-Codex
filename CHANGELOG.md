@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Adicionada a visao `EXECUTOR LIVE` no dashboard, com estado, modelo,
+  reasoning protocolar, service tier, thread/turn, tokens, plano quando
+  anunciado e atividade real do Executor.
+- Adicionada observabilidade cross-process por journal JSONL limitado e SSE
+  somente para leitura, com cursor/`Last-Event-ID`, heartbeats e reconexao
+  limitada. O caminho e derivado pelo servidor dentro de `runs_dir`; nao ha
+  processo Executor criado pelo dashboard.
+- A persistencia e a interface sanitizam segredos, caminhos sensiveis e
+  reasoning interno; a UI nao expõe chain-of-thought nem oferece shell
+  interativo ou filesystem arbitrario. `Clear View` afeta somente as linhas
+  locais do navegador.
+
 - Adicionado `dual-codex dashboard`, painel local somente em loopback para
   contas, roles, backend, modelos, reasoning, service tier/Fast, rate limits,
   uso e threads persistentes. Valores configurados e efetivos aparecem

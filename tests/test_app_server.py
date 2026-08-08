@@ -5,6 +5,7 @@ from pathlib import Path
 import queue
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -14,9 +15,11 @@ from dual_codex.app_server import (
     _normalise_report,
     _process_key,
     _sanitize_stderr,
+    app_server_call,
     run_codex_app_server,
 )
 from dual_codex.config import AgentConfig, OrchestratorConfig
+from dual_codex.live_events import read_journal
 
 
 class _FakeStdout:
@@ -170,6 +173,8 @@ class AppServerTests(unittest.TestCase):
                     prompt="short",
                     output_path=root / "first.json",
                     session_id="biel4-session",
+                    request_id="request-1",
+                    run_id="run-1",
                 )
                 second = run_codex_app_server(
                     config=config,
@@ -178,6 +183,8 @@ class AppServerTests(unittest.TestCase):
                     prompt=long_prompt,
                     output_path=root / "second.json",
                     session_id="biel4-session",
+                    request_id="request-1",
+                    run_id="run-1",
                 )
 
             self.assertEqual(first.returncode, 0)
@@ -189,6 +196,19 @@ class AppServerTests(unittest.TestCase):
             self.assertEqual(second.metadata["task_transport"], "app_server")
             self.assertEqual(len(fake_processes), 1)
             self.assertEqual(fake_processes[0].prompts, ["short", long_prompt])
+            journal_path = Path(first.metadata["live_event_journal"])
+            deadline = time.monotonic() + 1
+            journal_events = read_journal(journal_path)
+            while len(journal_events) < 4 and time.monotonic() < deadline:
+                time.sleep(0.01)
+                journal_events = read_journal(journal_path)
+            self.assertGreaterEqual(len(journal_events), 4)
+            self.assertEqual(journal_events[0].method, "turn/started")
+            self.assertIn("turn/completed", [event.method for event in journal_events])
+            self.assertTrue(all(event.request_id == "request-1" for event in journal_events))
+            self.assertTrue(all(event.run_id == "run-1" for event in journal_events))
+            self.assertTrue(all(event.thread_id == "thread-probe" for event in journal_events))
+            self.assertTrue(all(event.turn_id in {"turn-1", "turn-2"} for event in journal_events))
 
     def test_server_requests_are_denied_without_escalation(self) -> None:
         # The real probe used approvalPolicy=never and emitted no requests. This
@@ -200,6 +220,126 @@ class AppServerTests(unittest.TestCase):
         process._send = sent.append
         process._respond_to_server_request({"id": 7, "method": "item/commandExecution/requestApproval"})
         self.assertEqual(sent[0]["result"], {"decision": "decline"})
+
+    def test_event_journal_failure_cannot_change_notification_handling(self) -> None:
+        from collections import deque
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        process._events = deque()
+        process._event_journal = Mock()
+        process._event_journal.append_notification.side_effect = RuntimeError("journal unavailable")
+        process._event_context = {}
+        process._record_notification({"jsonrpc": "2.0", "method": "future/notice", "params": {}})
+        self.assertEqual(process.events[0]["method"], "future/notice")
+
+    def test_event_journal_contention_cannot_block_notification_handling(self) -> None:
+        from collections import deque
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        process._events = deque()
+        process._event_context = {}
+        process._event_publications = queue.Queue(maxsize=1)
+        process._event_journal = Mock()
+        blocked = threading.Event()
+        release = threading.Event()
+
+        def append_notification(*args, **kwargs):
+            blocked.set()
+            release.wait(2)
+
+        process._event_journal.append_notification.side_effect = append_notification
+        publisher = threading.Thread(target=process._publish_events, daemon=True)
+        publisher.start()
+        first = queued = dropped = None
+
+        try:
+            first_done = threading.Event()
+            first = threading.Thread(
+                target=lambda: (process._record_notification({"method": "blocked/notice"}), first_done.set()),
+                daemon=True,
+            )
+            first.start()
+            self.assertTrue(blocked.wait(1))
+            self.assertTrue(first_done.wait(0.5))
+
+            queued_done = threading.Event()
+            queued = threading.Thread(
+                target=lambda: (process._record_notification({"method": "queued/notice"}), queued_done.set()),
+                daemon=True,
+            )
+            queued.start()
+            self.assertTrue(queued_done.wait(0.5))
+
+            dropped_done = threading.Event()
+            dropped = threading.Thread(
+                target=lambda: (process._record_notification({"method": "dropped/notice"}), dropped_done.set()),
+                daemon=True,
+            )
+            dropped.start()
+            self.assertTrue(dropped_done.wait(0.5))
+            self.assertEqual([event["method"] for event in process.events], [
+                "blocked/notice", "queued/notice", "dropped/notice",
+            ])
+        finally:
+            release.set()
+            if first is not None:
+                first.join(1)
+            if queued is not None:
+                queued.join(1)
+            if dropped is not None:
+                dropped.join(1)
+            deadline = time.monotonic() + 1
+            while True:
+                try:
+                    process._event_publications.put_nowait(None)
+                    break
+                except queue.Full:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+            publisher.join(1)
+
+    def test_dashboard_rpc_clears_executor_event_context(self) -> None:
+        root = Path(".").resolve()
+        config = _config(root)
+        agent = AgentConfig(
+            codex_home=root / "profile",
+            model="",
+            reasoning_effort="high",
+            sandbox="workspace-write",
+            account_name="executor",
+            backend="app_server",
+        )
+        process = Mock()
+        process.request.return_value = {"id": 1, "result": {"ok": True}}
+        with patch("dual_codex.app_server._get_process", return_value=process):
+            self.assertEqual(
+                app_server_call(
+                    config=config,
+                    agent=agent,
+                    repository=root,
+                    method="account/read",
+                ),
+                {"ok": True},
+            )
+        process.set_event_context.assert_called_once_with(None)
+
+    def test_dashboard_request_restores_executor_context_after_suppression(self) -> None:
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        process._lock = threading.RLock()
+        process._event_journal = "executor-journal"
+        process._event_context = {"run_id": "run-1"}
+        process.request = Mock(return_value={"id": 1, "result": {}})
+        self.assertEqual(
+            process.request_without_event_journal("account/read", {}, timeout=1),
+            {"id": 1, "result": {}},
+        )
+        self.assertEqual(process._event_journal, "executor-journal")
+        self.assertEqual(process._event_context, {"run_id": "run-1"})
 
     def test_request_tolerates_an_intermediate_queue_timeout(self) -> None:
         from dual_codex.app_server import _AppServerProcess
