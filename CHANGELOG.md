@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-08-08
+
+- Consolidado o registro generico de contas com atribuicao independente de
+  roles, labels de exibicao e migracao segura do formato legado.
 - Adicionado backend preferencial `app_server` baseado em `codex app-server
   --stdio`: handshake JSON-RPC, threads persistentes por conta/repositorio,
   `thread/start`/`thread/resume`, `turn/start` e eventos oficiais de ciclo de
@@ -39,10 +43,8 @@
 - Adicionado backend Windows persistente com ConPTY via `node-pty`, named pipe
   local, sessoes independentes, follow-up e comandos `dual-codex terminal`.
 - Adicionado `backend = "windows"` por conta e status explicito do backend.
-- O backend foi implementado somente depois do probe TUI real em `workspace-write`
-  passar no Windows; WSL permanece como fallback.
-
-## 0.3.0
+- Mantido o probe TUI real em `workspace-write` como criterio de validacao do
+  fallback Windows; WSL permanece como fallback secundario.
 
 - Adicionado `dual-codex delegate` para implementacoes e correcoes sem chamar
   Architect/Reviewer pelo CLI oculto.
@@ -58,9 +60,8 @@
   `workspace-write`, com `--add-dir` limitado ao repositorio-alvo; Architect e
   Reviewer continuam em `read-only`.
 - Corrigida a classificacao para rejeitar reports validos sem mudancas,
-  bloqueios de permissao, testes `not_run` e falhas semanticas. A repeticao E2E
-  real de 2026-08-07 permaneceu bloqueada pelo sandbox efetivo `read-only` do
-  processo Codex e nao foi declarada como sucesso.
+  bloqueios de permissao, testes `not_run` e falhas semanticas, exigindo
+  validacao independente do diff e dos testes.
 
 ## 0.2.0
 
