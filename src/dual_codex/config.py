@@ -11,6 +11,7 @@ SUPPORTED_ROLES = ("orchestrator", "architect", "reviewer", "executor")
 SUPPORTED_BACKENDS = ("app_server", "windows")
 _ACCOUNT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _ROLE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_SETTING_VALUE = re.compile(r"^[^\x00-\x1f\x7f]{0,200}$")
 
 
 class ConfigError(ValueError):
@@ -25,6 +26,7 @@ class AccountConfig:
     model: str
     reasoning_effort: str
     backend: str = "windows"
+    service_tier: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,7 @@ class AgentConfig:
     account_name: str = ""
     label: str = ""
     backend: str = "windows"
+    service_tier: str = ""
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class OrchestratorConfig:
     app_server_thread_timeout: float = 30.0
     app_server_turn_start_timeout: float = 30.0
     app_server_turn_timeout: float = 600.0
+    dashboard_telemetry_timeout: float = 5.0
 
     @property
     def architect(self) -> AgentConfig:
@@ -90,6 +94,7 @@ class OrchestratorConfig:
             account_name=account.name,
             label=account.label,
             backend=account.backend,
+            service_tier=account.service_tier,
         )
 
 
@@ -117,6 +122,13 @@ def validate_role_name(role: str) -> str:
     return role
 
 
+def validate_setting_value(value: str, field: str) -> str:
+    value = str(value).strip()
+    if not _SETTING_VALUE.fullmatch(value):
+        raise ConfigError(f"{field} must be a single line of at most 200 characters.")
+    return value
+
+
 def _path(raw: Any, base: Path) -> Path:
     value = Path(str(raw)).expanduser()
     return value if value.is_absolute() else (base / value).resolve()
@@ -135,9 +147,10 @@ def _account(name: str, raw: dict[str, Any], base: Path) -> AccountConfig:
         name=validate_account_name(name),
         label=str(raw.get("label", "")).strip(),
         codex_home=_path(raw["codex_home"], base),
-        model=str(raw.get("model", "")).strip(),
-        reasoning_effort=str(raw.get("reasoning_effort", "high")).strip(),
+        model=validate_setting_value(raw.get("model", ""), "model"),
+        reasoning_effort=validate_setting_value(raw.get("reasoning_effort", "high"), "reasoning_effort") or "high",
         backend=backend,
+        service_tier=validate_setting_value(raw.get("service_tier", ""), "service_tier"),
     )
 
 
@@ -215,6 +228,7 @@ def load_config(path: Path) -> OrchestratorConfig:
     app_server_thread_timeout = float(orch.get("app_server_thread_timeout", 30.0))
     app_server_turn_start_timeout = float(orch.get("app_server_turn_start_timeout", 30.0))
     app_server_turn_timeout = float(orch.get("app_server_turn_timeout", 600.0))
+    dashboard_telemetry_timeout = float(orch.get("dashboard_telemetry_timeout", 5.0))
     if any(
         value <= 0
         for value in (
@@ -222,6 +236,7 @@ def load_config(path: Path) -> OrchestratorConfig:
             app_server_thread_timeout,
             app_server_turn_start_timeout,
             app_server_turn_timeout,
+            dashboard_telemetry_timeout,
         )
     ):
         raise ConfigError("App Server timeouts must be positive.")
@@ -244,4 +259,5 @@ def load_config(path: Path) -> OrchestratorConfig:
         app_server_thread_timeout=app_server_thread_timeout,
         app_server_turn_start_timeout=app_server_turn_start_timeout,
         app_server_turn_timeout=app_server_turn_timeout,
+        dashboard_telemetry_timeout=dashboard_telemetry_timeout,
     )

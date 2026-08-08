@@ -51,11 +51,21 @@ stderr sanitizado, o estado do Git e o diff preservado.
 
 ```text
 dual-codex status [--json]
+dual-codex dashboard [--port PORT] [--no-open]
 dual-codex doctor
 dual-codex run task.md
 dual-codex account ...
 dual-codex role ...
 ```
+
+`dual-codex dashboard` serve uma interface local em `127.0.0.1` (porta livre
+por padrão) e abre o navegador, salvo com `--no-open`. O painel usa chamadas
+estruturadas do App Server por conta e degrada métodos ausentes para
+`Unknown`/`Not available`; não há endpoint genérico de shell ou filesystem.
+Modelos são carregados de `model/list`, `model = ""` é explicitamente o
+default herdado, e alterações de model/reasoning/service tier são persistidas
+atomicamente para turnos futuros em `config.toml`. A thread atual nunca é
+alterada silenciosamente.
 
 ## Terminais nativos persistentes
 

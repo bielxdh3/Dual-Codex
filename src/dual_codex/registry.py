@@ -18,6 +18,7 @@ from .config import (
     is_legacy_raw,
     load_raw_config,
     validate_account_name,
+    validate_setting_value,
     validate_role_name,
 )
 from .process import codex_environment, run_command
@@ -93,6 +94,7 @@ def _registry_block(accounts: Mapping[str, AccountConfig], roles: Mapping[str, s
                 f"model = {_toml_string(account.model)}",
                 f"reasoning_effort = {_toml_string(account.reasoning_effort)}",
                 f"backend = {_toml_string(account.backend)}",
+                f"service_tier = {_toml_string(account.service_tier)}",
                 "",
             ]
         )
@@ -161,6 +163,7 @@ def _agent_for_status(account: AccountConfig):
         account_name=account.name,
         label=account.label,
         backend=account.backend,
+        service_tier=account.service_tier,
     )
 
 
@@ -236,6 +239,7 @@ def add_account(
         model=model.strip(),
         reasoning_effort=reasoning_effort.strip() or "high",
         backend="windows",
+        service_tier="",
     )
     output(f"Account: {account.name}")
     output(f"Label: {account.label or '(none)'}")
@@ -296,6 +300,7 @@ def rename_account(config: OrchestratorConfig, old_name: str, new_name: str) -> 
         model=old.model,
         reasoning_effort=old.reasoning_effort,
         backend=old.backend,
+        service_tier=old.service_tier,
     )
     roles = {
         role: new_name if account == old_name else account
@@ -319,6 +324,7 @@ def label_account(config: OrchestratorConfig, name: str, label: str) -> None:
         model=account.model,
         reasoning_effort=account.reasoning_effort,
         backend=account.backend,
+        service_tier=account.service_tier,
     )
     write_registry_config(config.config_path, accounts, config.roles)
 
@@ -356,6 +362,48 @@ def remove_account(
     write_registry_config(config.config_path, accounts, config.roles)
     if delete_profile and account.codex_home.exists():
         shutil.rmtree(account.codex_home)
+
+
+def update_account_settings(
+    config: OrchestratorConfig,
+    name: str,
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+    backend: str | None = None,
+) -> AccountConfig:
+    """Persist validated future-turn settings without touching profile credentials."""
+    if config.legacy:
+        raise ConfigError("Run 'dual-codex migrate-config' before changing account settings.")
+    name = validate_account_name(name)
+    account = config.accounts.get(name)
+    if account is None:
+        raise ConfigError(f"Unknown account '{name}'.")
+    new_backend = account.backend if backend is None else str(backend).strip()
+    if new_backend not in {"app_server", "windows"}:
+        raise ConfigError("backend must be 'app_server' or 'windows'.")
+    updated = AccountConfig(
+        name=account.name,
+        label=account.label,
+        codex_home=account.codex_home,
+        model=account.model if model is None else validate_setting_value(model, "model"),
+        reasoning_effort=(
+            account.reasoning_effort
+            if reasoning_effort is None
+            else (validate_setting_value(reasoning_effort, "reasoning_effort") or "high")
+        ),
+        backend=new_backend,
+        service_tier=(
+            account.service_tier
+            if service_tier is None
+            else validate_setting_value(service_tier, "service_tier")
+        ),
+    )
+    accounts = dict(config.accounts)
+    accounts[name] = updated
+    write_registry_config(config.config_path, accounts, config.roles)
+    return updated
 
 
 def assign_role(config: OrchestratorConfig, role: str, account_name: str) -> tuple[str | None, str]:
@@ -457,6 +505,7 @@ def migrate_legacy_config(
             model=legacy_architect.model,
             reasoning_effort=legacy_architect.reasoning_effort,
             backend=legacy_architect.backend,
+            service_tier=legacy_architect.service_tier,
         ),
         executor_name: AccountConfig(
             name=executor_name,
@@ -465,6 +514,7 @@ def migrate_legacy_config(
             model=legacy_executor.model,
             reasoning_effort=legacy_executor.reasoning_effort,
             backend=legacy_executor.backend,
+            service_tier=legacy_executor.service_tier,
         ),
     }
     roles = {

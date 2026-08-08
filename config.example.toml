@@ -14,12 +14,14 @@ app_server_initialize_timeout = 30
 app_server_thread_timeout = 30
 app_server_turn_start_timeout = 30
 app_server_turn_timeout = 600
+dashboard_telemetry_timeout = 5
 
 [accounts.primary]
 label = "Primary account"
 codex_home = "C:/Users/USER/CodexProfiles/architect"
 model = ""
 reasoning_effort = "high"
+service_tier = ""
 backend = "windows"
 
 [accounts.secondary]
@@ -27,6 +29,7 @@ label = "Secondary account"
 codex_home = "C:/Users/USER/CodexProfiles/executor"
 model = ""
 reasoning_effort = "high"
+service_tier = ""
 backend = "app_server"
 
 [roles]

@@ -103,6 +103,7 @@ dual-codex role unassign ROLE
 dual-codex role swap ROLE-A ROLE-B
 
 dual-codex status [--json]
+dual-codex dashboard [--port PORT] [--no-open]
 dual-codex doctor
 dual-codex run task.md
 dual-codex delegate --request-file request.json --result-file result.json
@@ -175,6 +176,21 @@ C:/Users/USER/CodexProfiles/executor
 
 Esses caminhos sao apenas exemplos; nao sao hardcoded no aplicativo e devem ser
 substituidos pelos perfis locais de cada maquina.
+
+## Dashboard local de contas
+
+`dual-codex dashboard` inicia o painel de controle em `127.0.0.1` e abre o
+navegador; use `--no-open` para apenas imprimir a URL ou `--port` para fixar
+uma porta. O painel consulta o App Server por processo/`CODEX_HOME` isolado e
+mostra contas, roles, backend, login, modelos anunciados, reasoning, Fast ou
+outro service tier, rate limits, uso e thread persistente quando disponíveis.
+
+O campo `model = ""` significa **Inherit Codex default**. O modelo efetivo só
+é exibido quando descoberto pelo catálogo/eventos instalados; nunca é inferido
+como Sol ou qualquer outro valor. Alterações do painel são validadas e salvas
+atomicamente para turnos futuros; a thread persistente atual não é alterada
+silenciosamente. Métricas ou métodos não suportados aparecem como `Unknown` ou
+`Not available`.
 
 ## Status e seguranca
 
