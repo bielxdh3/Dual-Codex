@@ -10,6 +10,8 @@ codex_command = "codex"
 node_command = "node"
 terminal_readiness_timeout = 60
 terminal_turn_start_timeout = 15
+# Native TUI live attach retains bounded output and reports behind cursors.
+# `delegate --reuse-existing` is strict and never starts or changes a TUI.
 app_server_initialize_timeout = 30
 app_server_thread_timeout = 30
 app_server_turn_start_timeout = 30

@@ -217,6 +217,7 @@ class DelegationTests(unittest.TestCase):
             self.assertEqual(result["exit_code"], 0)
             self.assertEqual(result["files_changed"], ["src/example.py"])
             artifact = Path(execute_mock.call_args.kwargs["task_artifact_path"])
+            self.assertEqual(artifact.parent, (config.runs_dir / "executor-task-artifacts").resolve())
             control_message = execute_mock.call_args.kwargs["prompt"]
             artifact_text = artifact.read_text(encoding="utf-8")
             self.assertIn("Implement the requested change.", artifact_text)

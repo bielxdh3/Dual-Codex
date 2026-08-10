@@ -41,3 +41,19 @@ Leia o `run_directory` no resultado. O diretorio preserva o pedido sanitizado,
 report, stderr sanitizado, estado do Git e diff; qualquer alteracao parcial do
 repositorio permanece visivel. A linha final e nao-zero quando o status nao e
 `completed`.
+
+## Attach interativo recusado ou viewer-only
+
+Use `terminal attach <session-id>` para um snapshot seguro. `--interactive`
+exige um registro Dual Codex nativo valido e nao cria um segundo Codex;
+`Ctrl-]` faz detach sem apagar o registro. Durante `delegate`, o lease de
+entrada e exclusivo da automacao, portanto o humano anexado fica watch-only.
+
+## `--reuse-existing` falha fechado
+
+Essa opcao exige sessao Windows registrada do `executor`, com host/PID e epoch
+validos, named pipe alcancavel, readiness confirmada, sem turno ou lease
+concorrente e com a mesma conta, `CODEX_HOME` e identidade do repositorio.
+Corrija a sessao registrada ou use o fluxo normal reuse/start quando iniciar
+uma nova sessao for aceitavel. Uma TUI aberta fora do Dual Codex nao pode ser
+adotada por nao possuir proveniencia verificavel.

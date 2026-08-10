@@ -28,10 +28,13 @@ def run_codex_exec(**kwargs):
     """Select the configured structured backend while preserving the TUI seam."""
     config = kwargs.get("config")
     agent = kwargs.get("agent")
+    if kwargs.get("reuse_existing") and agent is not None and agent.backend != "windows":
+        raise DelegationError("Strict reuse-existing requires a registered native Windows Executor TUI.")
     if agent is not None and agent.backend == "app_server":
         app_server_kwargs = dict(kwargs)
         app_server_kwargs.pop("schema_path", None)
         app_server_kwargs.pop("check", None)
+        app_server_kwargs.pop("reuse_existing", None)
         from .terminal import session_id_for
 
         app_server_kwargs["session_id"] = session_id_for(
@@ -43,6 +46,8 @@ def run_codex_exec(**kwargs):
         app_server_kwargs["role"] = kwargs.get("role", "executor")
         return run_codex_app_server(**app_server_kwargs)
     command_name = Path(config.codex_command).stem.casefold() if config else "codex"
+    if kwargs.get("reuse_existing") and not command_name.startswith("codex"):
+        raise DelegationError("Strict reuse-existing refuses non-Codex or non-native fallback backends.")
     if config is not None and not command_name.startswith("codex"):
         return _run_codex_exec_legacy(
             codex_command=config.codex_command,
@@ -66,6 +71,7 @@ def run_codex_exec(**kwargs):
         kwargs["agent"].account_name,
         kwargs["repository"],
     )
+    terminal_kwargs["reuse_existing"] = bool(kwargs.get("reuse_existing", False))
     return run_codex_terminal(**terminal_kwargs)
 
 
@@ -533,6 +539,8 @@ def _result(
     task_transport: str = "",
     task_artifact: str = "",
     task_sha256: str = "",
+    reuse_existing: bool = False,
+    reuse_provenance: Mapping[str, Any] | None = None,
     error: str = "",
 ) -> dict[str, Any]:
     return sanitize_value(
@@ -565,6 +573,8 @@ def _result(
             "task_transport": task_transport,
             "task_artifact": task_artifact,
             "task_sha256": task_sha256,
+            "reuse_existing": reuse_existing,
+            "reuse_provenance": dict(reuse_provenance or {"mode": "reuse_or_start"}),
             "error": error,
         }
     )
@@ -605,8 +615,12 @@ def _write_task_artifact(
     diff: str = "",
 ) -> tuple[Path, str]:
     """Write the bulk task once in a dedicated, non-secret transport directory."""
-    artifact_dir = config.runs_dir / "executor-task-artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    from .terminal import TerminalError, executor_task_artifact_dir
+
+    try:
+        artifact_dir = executor_task_artifact_dir(config, create=True)
+    except TerminalError as exc:
+        raise DelegationError(str(exc)) from exc
     artifact_path = artifact_dir / f"{run_dir.name}.md"
     task = sanitize_text(request.task)
     lines = [
@@ -887,6 +901,7 @@ def _failed_outcome(
     executor_sandbox: str = "",
     exit_code: int | None = None,
     parent_request_id: str | None = None,
+    reuse_existing: bool = False,
 ) -> DelegationOutcome:
     finished_at = _timestamp()
     atomic_write_json(
@@ -902,6 +917,7 @@ def _failed_outcome(
             executor_sandbox=executor_sandbox,
             exit_code=exit_code,
             parent_request_id=parent_request_id,
+            reuse_existing=reuse_existing,
             error=error,
         ),
     )
@@ -916,6 +932,7 @@ def delegate(
     stdin_text: str | None = None,
     repository_override: str | None = None,
     allow_dirty: bool = False,
+    reuse_existing: bool = False,
     output: Callable[[str], None] = print,
 ) -> DelegationOutcome:
     result_file = result_file.expanduser().resolve()
@@ -984,6 +1001,7 @@ def delegate(
                 summary="The executor role is unassigned.",
                 error=str(exc),
                 parent_request_id=request.parent_request_id,
+                reuse_existing=reuse_existing,
             )
         executor_account = agent.account_name
         executor_label = agent.label
@@ -1002,6 +1020,7 @@ def delegate(
                 executor_label=executor_label,
                 executor_sandbox=executor_sandbox,
                 parent_request_id=request.parent_request_id,
+                reuse_existing=reuse_existing,
             )
         output(f"Target repository: {request.repository}")
         run_id = _run_id(config, request)
@@ -1057,6 +1076,7 @@ def delegate(
                 run_id=run_dir.name,
                 role="executor",
                 progress=lambda message: _emit(output, started, f"[3/5] {message}"),
+                reuse_existing=reuse_existing,
             )
             stdout_path = run_dir / "executor.stdout.log"
             stderr_path = run_dir / "executor.stderr.log"
@@ -1114,6 +1134,8 @@ def delegate(
                 task_transport=command_result.metadata.get("task_transport", "file"),
                 task_artifact=command_result.metadata.get("task_artifact", str(task_artifact)),
                 task_sha256=command_result.metadata.get("task_sha256", task_sha256),
+                reuse_existing=reuse_existing,
+                reuse_provenance=command_result.metadata.get("reuse_provenance", {}),
                 error=error,
             )
             terminal_state = "completed" if status == "completed" else "cancelled" if status == "cancelled" else "failed"
@@ -1154,6 +1176,7 @@ def delegate(
             executor_label=executor_label,
             executor_sandbox=executor_sandbox,
             parent_request_id=request.parent_request_id,
+            reuse_existing=reuse_existing,
         )
     except (ConfigError, DelegationError, OSError, ValueError) as exc:
         finished_at = _timestamp()
@@ -1175,4 +1198,5 @@ def delegate(
             executor_label=executor_label,
             executor_sandbox=executor_sandbox,
             parent_request_id=request.parent_request_id,
+            reuse_existing=reuse_existing,
         )

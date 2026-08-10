@@ -13,6 +13,14 @@
   reasoning interno; a UI nao expõe chain-of-thought nem oferece shell
   interativo ou filesystem arbitrario. `Clear View` afeta somente as linhas
   locais do navegador.
+- Adicionado attach interativo real ao ConPTY Windows gerenciado, com saida
+  live limitada por cursor/sequence, encaminhamento raw, detach viewer-only e
+  lease de entrada unico; delegacoes em andamento tornam anexos humanos
+  watch-only.
+- Adicionado `delegate --reuse-existing`, que falha fechado sem uma sessao
+  nativa Dual Codex registrada, pronta, livre e com identidade exata de conta,
+  role, `CODEX_HOME`, repositorio, host e processo. TUIs abertas arbitrariamente
+  fora do Dual Codex nao podem ser adotadas.
 
 - Adicionado `dual-codex dashboard`, painel local somente em loopback para
   contas, roles, backend, modelos, reasoning, service tier/Fast, rate limits,

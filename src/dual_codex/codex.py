@@ -85,6 +85,7 @@ def run_codex_terminal(
     session_id: str,
     task_artifact_path: Path | None = None,
     task_sha256: str = "",
+    reuse_existing: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> CommandResult:
     from .terminal import TerminalError, TerminalManager
@@ -115,12 +116,20 @@ def run_codex_terminal(
             repository=repository,
             approval_policy="never" if agent.sandbox == "workspace-write" else "on-request",
             add_dirs=add_dirs,
+            reuse_existing=reuse_existing,
         )
         cursor = manager.turn_cursor(session.session_id)
-        turn_start = manager.send(session.session_id, prompt)
-        result = manager.wait_for_turn(session.session_id, cursor=cursor, progress=progress)
+        lease_owner = manager.begin_automation_turn(session.session_id)
+        try:
+            turn_start = manager.send(session.session_id, prompt, lease_owner=lease_owner)
+            result = manager.wait_for_turn(session.session_id, cursor=cursor, progress=progress)
+        finally:
+            manager.release_input_lease(session.session_id, lease_owner)
         assistant = result.get("assistant", "")
         report = _report_from_message(assistant)
+        status_snapshot = manager.status(session.session_id)
+        terminal_pid = int(status_snapshot.get("pid") or session.pid)
+        host_pid = int(status_snapshot.get("host_pid") or session.pid)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             json.dumps(report, ensure_ascii=False) if report is not None else assistant,
@@ -136,6 +145,22 @@ def run_codex_terminal(
                 "terminal_session_id": session.session_id,
                 "codex_session_id": result.get("session_id", ""),
                 "terminal_turn_start": json.dumps(turn_start, ensure_ascii=True),
+                "reuse_existing": reuse_existing,
+                "reuse_provenance": {
+                    "mode": "strict_existing" if reuse_existing else "reuse_or_start",
+                    "terminal_session_id": session.session_id,
+                    "session_record": session.session_file,
+                    "session_host_pid": session.pid,
+                    "session_process_epoch": session.process_epoch,
+                    "session_process_start_identity": session.process_start_identity,
+                    "terminal_pid": terminal_pid,
+                    "host_pid": host_pid,
+                    "account": session.account,
+                    "role": session.role,
+                    "repository_identity": session.repository_identity or str(session.repository),
+                    "codex_home_identity": session.codex_home_identity or str(session.codex_home),
+                    "codex_session_id": result.get("session_id", ""),
+                },
             },
         )
     except TerminalError as exc:

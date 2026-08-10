@@ -108,6 +108,22 @@ dual-codex terminal attach <session-id>
 dual-codex terminal terminate <session-id>
 ```
 
+O modo `dual-codex terminal attach <session-id> --interactive` usa o ConPTY
+registrado, saida live por cursor e encaminhamento raw de teclas. `Ctrl-]`
+desanexa sem terminar a sessao; quando a automacao possui o lease de entrada,
+o humano fica viewer-only. O attach padrao permanece o snapshot legado.
+
+Para exigir a reutilizacao exata, sem start ou fallback silencioso:
+
+```powershell
+dual-codex delegate --request-file request.json --result-file result.json --reuse-existing
+```
+
+Essa opcao exige o `executor` nativo Windows registrado e pronto, com a mesma
+conta, `CODEX_HOME`, repositorio, role e identidade host/PID/epoch. Ausencia,
+stale, busy ou pipe inalcançavel falham fechado. Uma TUI aberta externamente
+nao pode ser adotada.
+
 `--attach` mantém a saída do TUI visível no terminal atual. O comando
 `delegate` usa a sessão persistente do executor por conta e repositório,
 mantendo o contexto para correções subsequentes. A dependência Node é

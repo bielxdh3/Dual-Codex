@@ -363,6 +363,22 @@ WSL continua sendo o fallback secundario planejado; o runtime Windows nao usa `d
 `--dangerously-bypass-approvals-and-sandbox`, servidor de rede ou credenciais
 compartilhadas.
 
+### Attach interativo e reuse estrito
+
+`dual-codex terminal attach <session-id> --interactive` conecta ao ConPTY
+gerenciado, reproduz saida live limitada por cursor/sequence e encaminha teclas
+raw para o mesmo processo Codex. `Ctrl-]` faz detach viewer-only e preserva o
+ConPTY e o registro; durante uma delegacao o lease de entrada da automacao torna
+anexos humanos watch-only. O attach sem `--interactive` continua sendo o
+snapshot legado.
+
+`delegate --reuse-existing` reutiliza somente uma sessao Windows Dual Codex
+registrada, viva, pronta e livre do role `executor`, com a mesma conta,
+`CODEX_HOME` e identidade do repositorio. Ausencia, stale, busy, PID/epoch
+incompativel ou pipe inalcançavel falham fechado, sem iniciar outro TUI e sem
+alterar model/reasoning escolhidos manualmente. TUIs abertas arbitrariamente
+fora do Dual Codex nao podem ser adotadas.
+
 Consulte [docs/CLI.md](docs/CLI.md), [docs/APP-INTEGRATION.md](docs/APP-INTEGRATION.md)
 e [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) para os schemas, o fluxo
 de correcoes e a recuperacao de falhas.

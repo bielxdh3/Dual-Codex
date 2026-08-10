@@ -57,6 +57,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Explicitly allow a dirty target repository for this run",
     )
+    delegation.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Require and reuse the exact registered live native Executor TUI; never start or fall back",
+    )
 
     terminal = sub.add_parser("terminal", help="Manage native Windows Codex terminal sessions")
     terminal_sub = terminal.add_subparsers(dest="terminal_command", required=True)
@@ -74,6 +79,7 @@ def _parser() -> argparse.ArgumentParser:
     terminal_attach = terminal_sub.add_parser("attach", help="Stream captured output from a session")
     terminal_attach.add_argument("session_id")
     terminal_attach.add_argument("--lines", type=int, default=80)
+    terminal_attach.add_argument("--interactive", action="store_true", help="Attach to the live ConPTY with raw key forwarding")
     terminal_terminate = terminal_sub.add_parser("terminate", help="Stop a session")
     terminal_terminate.add_argument("session_id")
 
@@ -310,6 +316,49 @@ def _account_agent(config, account_name: str, role: str) -> AgentConfig:
     )
 
 
+def _interactive_attach(manager: TerminalManager, session_id: str) -> None:
+    if sys.platform != "win32":
+        raise TerminalError("Interactive ConPTY attach requires Windows.")
+    import msvcrt
+
+    attached = manager.attach_interactive(session_id)
+    owner = str(attached["owner"])
+    cursor = 0
+    offset = 0
+    try:
+        if attached["viewer_only"]:
+            print("Attached viewer-only: terminal input is leased by automation.", file=sys.stderr, flush=True)
+        print("Interactive attach active; press Ctrl-] to detach safely.", file=sys.stderr, flush=True)
+        while manager.status(session_id).get("state") == "running":
+            packet = manager.read_since(session_id, cursor, offset=offset)
+            if packet.get("behind_cursor"):
+                print("[live output cursor fell behind; replaying retained output]", file=sys.stderr, flush=True)
+                cursor = max(0, int(packet.get("oldest_seq", 1)) - 1)
+                offset = 0
+                continue
+            text = str(packet.get("output", ""))
+            if text:
+                print(text, end="", flush=True)
+            cursor = int(packet.get("next_seq", cursor))
+            offset = int(packet.get("next_offset", 0))
+            while msvcrt.kbhit():
+                key = msvcrt.getwch()
+                if key == "\x1d":
+                    return
+                if key in {"\x00", "\xe0"}:
+                    extended = msvcrt.getwch()
+                    key = {"H": "\x1b[A", "P": "\x1b[B", "K": "\x1b[D", "M": "\x1b[C"}.get(extended, "")
+                if not attached["viewer_only"] and key:
+                    try:
+                        manager.write_input(session_id, key, owner)
+                    except TerminalError:
+                        attached["viewer_only"] = True
+                        print("[terminal input lease lost; continuing viewer-only]", file=sys.stderr, flush=True)
+            time.sleep(float(attached["poll_seconds"]))
+    finally:
+        manager.detach_interactive(session_id, owner)
+
+
 def main(argv: list[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -390,6 +439,9 @@ def main(argv: list[str] | None = None) -> int:
                 manager.send(args.session_id, args.message)
                 return 0
             if args.terminal_command == "attach":
+                if args.interactive:
+                    _interactive_attach(manager, args.session_id)
+                    return 0
                 print(manager.read(args.session_id, args.lines), end="")
                 return 0
             if args.terminal_command == "terminate":
@@ -404,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
                 result_file=Path(args.result_file),
                 repository_override=args.repository,
                 allow_dirty=args.allow_dirty,
+                reuse_existing=args.reuse_existing,
                 output=lambda message: print(message, flush=True),
             )
             print(
