@@ -67,6 +67,30 @@ default herdado, e alterações de model/reasoning/service tier são persistidas
 atomicamente para turnos futuros em `config.toml`. A thread atual nunca é
 alterada silenciosamente.
 
+### Live Executor
+
+A aba `EXECUTOR LIVE` observa o Executor real por meio do journal JSONL escrito
+pela delegacao/App Server. O dashboard nao inicia um App Server proprio para
+essa tela. O journal e escolhido no servidor a partir de `runs_dir`, da conta e
+role `executor` e da identidade do repositorio; nenhum caminho de arquivo vindo
+do navegador e aceito.
+
+O snapshot e o SSE sao limitados por `live_event_journal_max_records`,
+`live_event_journal_max_record_bytes` e `live_event_journal_max_detail_bytes`.
+O stream suporta replay inicial, cursor ou `Last-Event-ID`, IDs monotonicamente
+crescentes, heartbeats e reconexao com backoff. A UI tambem limita as linhas
+mantidas no navegador; `Clear View` nao remove o journal nem altera o servidor.
+
+Eventos passam por sanitizacao antes da persistencia: segredos, caminhos
+sensiveis, arquivos de autenticacao e reasoning interno sao removidos ou
+redigidos. A UI usa insercao textual, nao HTML executavel, e nao exibe
+chain-of-thought. Commands, output, diffs, files e mensagens so aparecem com
+evidencia protocolar; nao ha inferencia de leituras de arquivo.
+
+O dashboard continua preso a `127.0.0.1` e valida Host/Origin. GET e SSE sao
+somente leitura; nao existe shell interativo, browsing arbitrario de arquivos,
+CORS ou listener remoto nessa funcionalidade.
+
 ## Terminais nativos persistentes
 
 O backend Windows usa um pequeno host Node com `node-pty` sobre ConPTY. Cada
@@ -76,13 +100,29 @@ O host desativa a integracao opcional `apps` do CLI para que o TUI nao dependa
 do MCP `codex_apps` do Desktop.
 
 ```text
-dual-codex terminal start biel3 --role architect --attach
-dual-codex terminal start biel4 --role executor --attach
+dual-codex terminal start architect-account --role architect --attach
+dual-codex terminal start executor-account --role executor --attach
 dual-codex terminal list --json
 dual-codex terminal send <session-id> "mensagem de follow-up"
 dual-codex terminal attach <session-id>
 dual-codex terminal terminate <session-id>
 ```
+
+O modo `dual-codex terminal attach <session-id> --interactive` usa o ConPTY
+registrado, saida live por cursor e encaminhamento raw de teclas. `Ctrl-]`
+desanexa sem terminar a sessao; quando a automacao possui o lease de entrada,
+o humano fica viewer-only. O attach padrao permanece o snapshot legado.
+
+Para exigir a reutilizacao exata, sem start ou fallback silencioso:
+
+```powershell
+dual-codex delegate --request-file request.json --result-file result.json --reuse-existing
+```
+
+Essa opcao exige o `executor` nativo Windows registrado e pronto, com a mesma
+conta, `CODEX_HOME`, repositorio, role e identidade host/PID/epoch. Ausencia,
+stale, busy ou pipe inalcançavel falham fechado. Uma TUI aberta externamente
+nao pode ser adotada.
 
 `--attach` mantém a saída do TUI visível no terminal atual. O comando
 `delegate` usa a sessão persistente do executor por conta e repositório,

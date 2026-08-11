@@ -59,9 +59,62 @@
     "task_transport": {"type": "string", "enum": ["", "file", "inline", "app_server"]},
     "task_artifact": {"type": "string"},
     "task_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$|^$"},
+    "reuse_existing": {"type": "boolean"},
+    "reuse_provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"type": "string", "enum": ["reuse_or_start", "strict_existing"]},
+        "terminal_session_id": {"type": "string", "minLength": 1},
+        "session_record": {"type": "string", "minLength": 1},
+        "session_host_pid": {"type": "integer", "minimum": 1},
+        "terminal_pid": {"type": "integer", "minimum": 1},
+        "host_pid": {"type": "integer", "minimum": 1},
+        "session_process_epoch": {"type": "string", "minLength": 1},
+        "session_process_start_identity": {"type": "string"},
+        "account": {"type": "string", "minLength": 1},
+        "role": {"type": "string", "minLength": 1},
+        "repository_identity": {"type": "string", "minLength": 1},
+        "codex_home_identity": {"type": "string", "minLength": 1},
+        "codex_session_id": {"type": "string"}
+      }
+    },
     "app_server_thread_id": {"type": "string"},
     "app_server_turn_id": {"type": "string"},
     "app_server_process_id": {"type": "string"},
     "error": {"type": "string"}
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["reuse_existing"],
+        "properties": {
+          "reuse_existing": {"const": true},
+          "status": {"const": "completed"}
+        }
+      },
+      "then": {
+        "required": ["reuse_provenance"],
+        "properties": {
+          "reuse_provenance": {
+            "required": [
+              "mode",
+              "terminal_session_id",
+              "session_record",
+              "session_host_pid",
+              "terminal_pid",
+              "host_pid",
+              "session_process_epoch",
+              "account",
+              "role",
+              "repository_identity",
+              "codex_home_identity",
+              "codex_session_id"
+            ]
+          }
+        }
+      }
+    }
+  ]
 }

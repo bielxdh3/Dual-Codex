@@ -61,6 +61,9 @@ class OrchestratorConfig:
     app_server_turn_start_timeout: float = 30.0
     app_server_turn_timeout: float = 600.0
     dashboard_telemetry_timeout: float = 5.0
+    live_event_journal_max_records: int = 2000
+    live_event_journal_max_record_bytes: int = 65536
+    live_event_journal_max_detail_bytes: int = 16384
 
     @property
     def architect(self) -> AgentConfig:
@@ -229,6 +232,18 @@ def load_config(path: Path) -> OrchestratorConfig:
     app_server_turn_start_timeout = float(orch.get("app_server_turn_start_timeout", 30.0))
     app_server_turn_timeout = float(orch.get("app_server_turn_timeout", 600.0))
     dashboard_telemetry_timeout = float(orch.get("dashboard_telemetry_timeout", 5.0))
+    live_event_journal_max_records = int(orch.get("live_event_journal_max_records", 2000))
+    live_event_journal_max_record_bytes = int(orch.get("live_event_journal_max_record_bytes", 65536))
+    live_event_journal_max_detail_bytes = int(orch.get("live_event_journal_max_detail_bytes", 16384))
+    if any(
+        value <= 0
+        for value in (
+            live_event_journal_max_records,
+            live_event_journal_max_record_bytes,
+            live_event_journal_max_detail_bytes,
+        )
+    ):
+        raise ConfigError("Live event journal limits must be positive.")
     if any(
         value <= 0
         for value in (
@@ -260,4 +275,7 @@ def load_config(path: Path) -> OrchestratorConfig:
         app_server_turn_start_timeout=app_server_turn_start_timeout,
         app_server_turn_timeout=app_server_turn_timeout,
         dashboard_telemetry_timeout=dashboard_telemetry_timeout,
+        live_event_journal_max_records=live_event_journal_max_records,
+        live_event_journal_max_record_bytes=live_event_journal_max_record_bytes,
+        live_event_journal_max_detail_bytes=live_event_journal_max_detail_bytes,
     )

@@ -20,7 +20,11 @@ from .report import atomic_write_json
 
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
+_PIPE_NAME = re.compile(r"^\\\\\.\\pipe\\dual-codex-([A-Za-z0-9_-]{1,96})-([0-9a-f]{16,64})$")
+_LEASE_OWNER = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
 TERMINAL_INLINE_MESSAGE_MAX = 500
+TERMINAL_INPUT_MAX_BYTES = 8192
+TERMINAL_LIVE_READ_MAX_BYTES = 65536
 TERMINAL_SUBMIT_DELAY_SECONDS = 0.1
 TERMINAL_COMPOSER_ACK_TIMEOUT_SECONDS = 5.0
 _COMPLETED_EVENTS = {"turn_completed", "turn_complete", "task_completed", "task_complete"}
@@ -102,6 +106,13 @@ class _HardenedTuiReadinessDetector:
     _PROMPT = re.compile(r"(?m)^\s*\u203a\s*(?P<text>[^\r\n]*)$")
     _MODEL = re.compile(r"(?m)^\s*(?:\u2502\s*)?model:\s+(?!loading\b)(?P<model>[^\r\n]+)$")
     _DIRECTORY = re.compile(r"(?m)^\s*(?:\u2502\s*)?directory:\s+(?P<directory>[^\r\n]+)$")
+    _STATUS_FOOTER = re.compile(
+        r"(?m)^\s*(?:\u2502\s*)?"
+        r"(?P<model>gpt-[A-Za-z0-9][A-Za-z0-9._-]*\s+(?:minimal|low|medium|high|xhigh|max))"
+        r"\s+\u00b7\s+"
+        r"(?P<directory>(?:~|[A-Za-z]:)[\\/](?:[^\r\n\u2502]*[^\s\r\n\u2502])?)"
+        r"\s*(?:\u2502)?\s*$"
+    )
     _COSMETIC = frozenset(
         {
             "Explain this codebase",
@@ -161,7 +172,14 @@ class _HardenedTuiReadinessDetector:
         directory_matches = list(self._DIRECTORY.finditer(text))
         directory_match = directory_matches[-1] if directory_matches else None
         last_directory = directory_match.start() if directory_match else -1
+        footer_matches = list(self._STATUS_FOOTER.finditer(text))
+        footer_match = footer_matches[-1] if footer_matches else None
+        if footer_match is not None and footer_match.start() > max(last_model, last_directory):
+            model_match = directory_match = footer_match
+            last_model = footer_match.start("model")
+            last_directory = footer_match.start("directory")
         last_working = text.rfind("Working (")
+        last_error = text.rfind("Error:")
 
         if last_trust > max(last_prompt, last_banner) or last_disabled > max(last_prompt, last_banner):
             self.seen_trust |= last_trust >= 0
@@ -182,12 +200,14 @@ class _HardenedTuiReadinessDetector:
             prompt_text in self._COSMETIC or self._COSMETIC_PATTERN.search(prompt_text) is not None
         )
         self.seen_placeholder |= cosmetic
+        last_blocker = max(last_loading, last_working, last_trust, last_disabled, last_error)
+        marker_boundary = min(last_prompt, last_model, last_directory)
         normal_markers = (
-            last_banner > last_loading
-            and last_model >= 0
-            and last_directory >= 0
-            and last_model > last_loading
-            and last_directory > last_loading
+            marker_boundary > last_blocker
+            and (
+                last_prompt < last_model < last_directory
+                or last_model < last_directory < last_prompt
+            )
         )
         if prompt_match is not None and normal_markers and last_prompt > last_working:
             self.seen_model_ready = True
@@ -200,7 +220,7 @@ class _HardenedTuiReadinessDetector:
             self._fingerprint = fingerprint
             if self.stable_samples >= 2:
                 self.seen_ready = True
-                self.ready_evidence = "stable Codex banner/model/directory/composer markers"
+                self.ready_evidence = "stable Codex model/directory/composer markers"
                 self.state = self.READY
                 return self.state
         else:
@@ -290,6 +310,103 @@ class TerminalError(RuntimeError):
     pass
 
 
+def validate_pipe_name(value: str, *, session_id: str = "") -> str:
+    """Accept only Dual Codex's local, session-bound named-pipe shape."""
+    match = _PIPE_NAME.fullmatch(str(value))
+    if not match or (session_id and match.group(1) != validate_session_id(session_id)):
+        raise TerminalError("Invalid Dual Codex terminal named pipe.")
+    return str(value)
+
+
+def validate_lease_owner(value: str) -> str:
+    if not _LEASE_OWNER.fullmatch(str(value)):
+        raise TerminalError("Invalid terminal input lease owner.")
+    return str(value)
+
+
+def _same_add_dirs(recorded: tuple[Path, ...], requested: tuple[Path, ...]) -> bool:
+    recorded_keys = {path_identity_key(item) for item in recorded}
+    requested_keys = {path_identity_key(item.resolve()) for item in requested}
+    return requested_keys <= recorded_keys
+
+
+def _reject_symlink_components(path: Path) -> None:
+    current = Path(path)
+    while True:
+        if current.is_symlink():
+            raise TerminalError(f"Unsafe symlink path component: {current}")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
+def executor_task_artifact_dir(config: OrchestratorConfig, *, create: bool = False) -> Path:
+    """Return the only file-transport directory granted to Executor TUIs."""
+    runs_dir = Path(config.runs_dir).expanduser()
+    artifact_dir = runs_dir / "executor-task-artifacts"
+    _reject_symlink_components(runs_dir)
+    _reject_symlink_components(artifact_dir)
+    runs_identity = runs_dir.resolve(strict=False)
+    artifact_identity = artifact_dir.resolve(strict=False)
+    try:
+        artifact_identity.relative_to(runs_identity)
+    except ValueError as exc:
+        raise TerminalError("Executor task transport path escapes the configured runs directory.") from exc
+    if artifact_dir.exists() and not artifact_dir.is_dir():
+        raise TerminalError(f"Executor task transport path is not a directory: {artifact_dir}")
+    if create:
+        try:
+            runs_dir.mkdir(parents=True, exist_ok=True)
+            artifact_dir.mkdir(exist_ok=True)
+        except OSError as exc:
+            raise TerminalError(f"Could not create Executor task transport directory: {artifact_dir}") from exc
+        _reject_symlink_components(artifact_dir)
+    if artifact_dir.exists() and not artifact_dir.is_dir():
+        raise TerminalError(f"Executor task transport path is not a directory: {artifact_dir}")
+    return artifact_identity
+
+
+def _safe_directory(value: Path, *, label: str) -> Path:
+    raw = Path(value).expanduser()
+    _reject_symlink_components(raw)
+    if not raw.is_dir():
+        raise TerminalError(f"{label} does not exist or is unsafe: {raw}")
+    return raw.resolve()
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    left_key = Path(path_identity_key(left))
+    right_key = Path(path_identity_key(right))
+    return left_key.is_relative_to(right_key) or right_key.is_relative_to(left_key)
+
+
+def _process_start_identity(pid: int) -> str:
+    """Return a PID-reuse-resistant Windows process start identity."""
+    if os.name != "nt" or int(pid) <= 0:
+        return ""
+    try:
+        from ctypes import byref, wintypes
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return ""
+        created = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        try:
+            if not kernel32.GetProcessTimes(handle, byref(created), byref(exited), byref(kernel), byref(user)):
+                return ""
+            return str((int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime))
+        finally:
+            kernel32.CloseHandle(handle)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return ""
+
+
 def validate_control_message(message: str, *, forbidden_text: str = "") -> str:
     if not isinstance(message, str) or not message.strip():
         raise TerminalError("Terminal control message must be non-empty text.")
@@ -330,8 +447,13 @@ class TerminalSession:
     state: str = "starting"
     add_dirs: tuple[Path, ...] = ()
     process_started_at: float = 0.0
+    process_start_identity: str = ""
+    process_epoch: str = ""
+    repository_identity: str = ""
+    codex_home_identity: str = ""
     baseline_rollout_mtimes: dict[str, float] = field(default_factory=dict)
     codex_session_id: str = ""
+    task_artifact_dir: Path | None = None
 
     @classmethod
     def from_record(cls, raw: dict[str, Any]) -> "TerminalSession":
@@ -350,11 +472,16 @@ class TerminalSession:
             state=str(raw.get("state", "unknown")),
             add_dirs=tuple(Path(item) for item in raw.get("add_dirs", [])),
             process_started_at=float(raw.get("process_started_at", 0.0)),
+            process_start_identity=str(raw.get("process_start_identity", "")),
+            process_epoch=str(raw.get("process_epoch", "")),
+            repository_identity=str(raw.get("repository_identity", "")),
+            codex_home_identity=str(raw.get("codex_home_identity", "")),
             baseline_rollout_mtimes={
                 str(key): float(value)
                 for key, value in dict(raw.get("baseline_rollout_mtimes", {})).items()
             },
             codex_session_id=str(raw.get("codex_session_id", "")),
+            task_artifact_dir=(Path(raw["task_artifact_dir"]) if raw.get("task_artifact_dir") else None),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -374,8 +501,13 @@ class TerminalSession:
             "state": self.state,
             "add_dirs": [str(item) for item in self.add_dirs],
             "process_started_at": self.process_started_at,
+            "process_start_identity": self.process_start_identity,
+            "process_epoch": self.process_epoch,
+            "repository_identity": self.repository_identity or path_identity_key(self.repository),
+            "codex_home_identity": self.codex_home_identity or path_identity_key(self.codex_home),
             "baseline_rollout_mtimes": self.baseline_rollout_mtimes,
             "codex_session_id": self.codex_session_id,
+            "task_artifact_dir": str(self.task_artifact_dir) if self.task_artifact_dir else "",
         }
 
 
@@ -435,6 +567,9 @@ def _terminal_environment(agent: AgentConfig) -> dict[str, str]:
 
 
 def _pipe_request(pipe: str, payload: dict[str, Any]) -> dict[str, Any]:
+    validate_pipe_name(pipe)
+    if not isinstance(payload, dict) or not payload.get("op"):
+        raise TerminalError("Terminal control request is invalid.")
     try:
         with open(pipe, "r+b", buffering=0) as connection:
             connection.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -463,7 +598,13 @@ def _session_files(codex_home: Path) -> list[Path]:
     return files
 
 
-def find_session_file(codex_home: Path, repository: Path, *, after: float = 0.0) -> tuple[Path, str] | None:
+def find_session_file(
+    codex_home: Path,
+    repository: Path,
+    *,
+    after: float = 0.0,
+    codex_session_id: str = "",
+) -> tuple[Path, str] | None:
     match: tuple[Path, float, str] | None = None
     for path in _session_files(codex_home):
         try:
@@ -475,7 +616,12 @@ def find_session_file(codex_home: Path, repository: Path, *, after: float = 0.0)
             payload = first.get("payload", first) if isinstance(first, dict) else {}
             cwd = str(payload.get("cwd", ""))
             session_id = str(payload.get("session_id") or payload.get("id") or "")
-            if same_path(cwd, repository) and session_id and (match is None or stat.st_mtime > match[1]):
+            if (
+                same_path(cwd, repository)
+                and session_id
+                and (not codex_session_id or session_id == codex_session_id)
+                and (match is None or stat.st_mtime > match[1])
+            ):
                 match = (path, stat.st_mtime, session_id)
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
             continue
@@ -576,7 +722,14 @@ class TerminalManager:
     def _load(self, session_id: str) -> TerminalSession:
         path = _record_path(self.config, session_id)
         try:
-            return TerminalSession.from_record(json.loads(path.read_text(encoding="utf-8")))
+            session = TerminalSession.from_record(json.loads(path.read_text(encoding="utf-8")))
+            validate_session_id(session.session_id)
+            validate_pipe_name(session.pipe, session_id=session.session_id)
+            if session.repository_identity and session.repository_identity != path_identity_key(session.repository):
+                raise TerminalError("Terminal session repository identity does not match its record.")
+            if session.codex_home_identity and session.codex_home_identity != path_identity_key(session.codex_home):
+                raise TerminalError("Terminal session CODEX_HOME identity does not match its record.")
+            return session
         except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise TerminalError(f"Unknown terminal session '{session_id}'.") from exc
 
@@ -585,7 +738,17 @@ class TerminalManager:
         try:
             result = _pipe_request(session.pipe, {"op": "status"})
             state = result["state"]
-            return {**session.as_dict(), **state, "state": "running" if state.get("alive") else "exited"}
+            identity_match = True
+            recorded_identity = session.process_start_identity
+            actual_identity = str(state.get("process_start_identity", "")) or _process_start_identity(session.pid)
+            if recorded_identity and actual_identity and recorded_identity != actual_identity:
+                identity_match = False
+            if recorded_identity and not actual_identity and os.name == "nt":
+                identity_match = False
+            if session.process_epoch and state.get("process_epoch") and session.process_epoch != state.get("process_epoch"):
+                identity_match = False
+            lifecycle = "running" if state.get("alive") and identity_match else ("stale" if state.get("alive") else "exited")
+            return {**session.as_dict(), **state, "identity_match": identity_match, "state": lifecycle}
         except TerminalError:
             return {**session.as_dict(), "state": "unreachable"}
 
@@ -905,10 +1068,18 @@ class TerminalManager:
         repository = repository.resolve()
         if not repository.is_dir():
             raise TerminalError(f"Terminal repository does not exist: {repository}")
-        resolved_add_dirs = tuple(Path(item).resolve() for item in add_dirs)
-        for add_dir in resolved_add_dirs:
-            if not add_dir.is_dir() or add_dir.is_symlink():
-                raise TerminalError(f"Task transport directory does not exist or is unsafe: {add_dir}")
+        task_artifact_dir: Path | None = None
+        if role == "executor":
+            task_artifact_dir = executor_task_artifact_dir(self.config, create=True)
+            requested_add_dirs = tuple(Path(item) for item in add_dirs)
+            if requested_add_dirs and any(not same_path(item, task_artifact_dir) for item in requested_add_dirs):
+                raise TerminalError("Executor may register only the canonical task transport directory.")
+            resolved_add_dirs = (task_artifact_dir,)
+        else:
+            resolved_add_dirs = tuple(_safe_directory(Path(item), label="Task transport directory") for item in add_dirs)
+            canonical_dir = executor_task_artifact_dir(self.config)
+            if any(_paths_overlap(item, canonical_dir) for item in resolved_add_dirs):
+                raise TerminalError("Non-Executor sessions may not register the Executor task transport directory.")
         record_path = _record_path(self.config, session_id)
         if record_path.exists():
             current = self.status(session_id)
@@ -920,14 +1091,17 @@ class TerminalManager:
         sessions = _session_dir(self.config)
         sessions.mkdir(parents=True, exist_ok=True)
         pipe = rf"\\.\pipe\dual-codex-{session_id}-{uuid4().hex}"
+        validate_pipe_name(pipe, session_id=session_id)
         log_file = sessions / f"{session_id}.pty.log"
         node = _node_path(self.config)
         helper = _helper_path(self.config)
+        process_epoch = uuid4().hex
         command = [
             node, str(helper), "--session-id", session_id, "--pipe", pipe,
             "--cwd", str(repository), "--codex-command", self.config.codex_command,
             "--sandbox", agent.sandbox, "--approval-policy", approval_policy,
             "--model", agent.model,
+            "--process-epoch", process_epoch,
         ]
         if resolved_add_dirs:
             command.extend(["--add-dir", str(resolved_add_dirs[0])])
@@ -957,15 +1131,28 @@ class TerminalManager:
             session_id=session_id, account=agent.account_name, label=agent.label,
             role=role, repository=repository, codex_home=agent.codex_home,
             pipe=pipe, pid=process.pid, started_at=datetime.now(timezone.utc).isoformat(),
-            log_file=log_file, add_dirs=resolved_add_dirs,
+            log_file=log_file, session_file=str(record_path.resolve()), add_dirs=resolved_add_dirs,
             process_started_at=process_started_at,
+            process_start_identity=_process_start_identity(process.pid),
+            process_epoch=process_epoch,
+            repository_identity=path_identity_key(repository),
+            codex_home_identity=path_identity_key(agent.codex_home),
             baseline_rollout_mtimes=baseline_rollout_mtimes,
+            task_artifact_dir=task_artifact_dir,
         )
         atomic_write_json(record_path, session.as_dict())
         self.wait_until_ready(session_id)
-        return session
+        ready = replace(session, state="ready")
+        try:
+            atomic_write_json(record_path, ready.as_dict())
+        except OSError:
+            pass
+        return ready
 
     def ensure(self, **kwargs: Any) -> TerminalSession:
+        reuse_existing = bool(kwargs.pop("reuse_existing", False))
+        if reuse_existing:
+            return self.reuse_existing(**kwargs)
         session_id = str(kwargs["session_id"])
         if _record_path(self.config, session_id).exists():
             current = self.status(session_id)
@@ -980,7 +1167,71 @@ class TerminalManager:
                 return self._load(session_id)
         return self.start(**kwargs)
 
-    def send(self, session_id: str, message: str) -> dict[str, Any]:
+    def reuse_existing(
+        self,
+        *,
+        session_id: str,
+        agent: AgentConfig,
+        role: str,
+        repository: Path,
+        approval_policy: str = "on-request",
+        add_dirs: tuple[Path, ...] = (),
+    ) -> TerminalSession:
+        """Reuse only a registered, live, identity-matching Executor TUI."""
+        del approval_policy  # Reuse never changes the running TUI.
+        validate_session_id(session_id)
+        path = _record_path(self.config, session_id)
+        if not path.is_file():
+            raise TerminalError("Strict reuse-existing refused: no registered terminal session.")
+        session = self._load(session_id)
+        expected_record = str(path.resolve())
+        if session.session_file != expected_record:
+            raise TerminalError("Strict reuse-existing refused: session provenance is incomplete.")
+        repository = repository.resolve()
+        if session.account != agent.account_name or session.role != role:
+            raise TerminalError("Strict reuse-existing refused: account or role mismatch.")
+        if not same_path(session.repository, repository):
+            raise TerminalError("Strict reuse-existing refused: repository identity mismatch.")
+        if not same_path(session.codex_home, agent.codex_home):
+            raise TerminalError("Strict reuse-existing refused: CODEX_HOME identity mismatch.")
+        if role != "executor" or agent.backend != "windows":
+            raise TerminalError("Strict reuse-existing refused: only the native Windows Executor TUI is eligible.")
+        canonical_dir = executor_task_artifact_dir(self.config)
+        if not canonical_dir.is_dir():
+            raise TerminalError("Strict reuse-existing refused: canonical task transport directory is unavailable.")
+        registered_dir = getattr(session, "task_artifact_dir", None)
+        if not registered_dir:
+            raise TerminalError("Strict reuse-existing refused: canonical task transport registration is missing.")
+        registered_dir = _safe_directory(Path(registered_dir), label="Registered task transport directory")
+        if len(session.add_dirs) != 1:
+            raise TerminalError("Strict reuse-existing refused: registered task transport is not canonical.")
+        registered_add_dir = _safe_directory(session.add_dirs[0], label="Registered task transport directory")
+        if not same_path(registered_dir, canonical_dir) or not same_path(registered_add_dir, canonical_dir):
+            raise TerminalError("Strict reuse-existing refused: registered task transport is not canonical.")
+        requested_add_dirs = tuple(Path(item) for item in add_dirs)
+        if requested_add_dirs:
+            for add_dir in requested_add_dirs:
+                if not same_path(_safe_directory(add_dir, label="Required task transport directory"), canonical_dir):
+                    raise TerminalError("Strict reuse-existing refused: required task transport directory is not canonical.")
+        status = self.status(session_id)
+        if status.get("state") != "running" or status.get("identity_match") is False:
+            raise TerminalError(
+                f"Strict reuse-existing refused: terminal session is {status.get('state', 'unusable')}."
+            )
+        if int(status.get("host_pid") or 0) != session.pid:
+            raise TerminalError("Strict reuse-existing refused: terminal host PID mismatch.")
+        if not session.process_epoch or status.get("process_epoch") != session.process_epoch:
+            raise TerminalError("Strict reuse-existing refused: terminal process epoch mismatch.")
+        lease = status.get("input_lease")
+        if isinstance(lease, dict) and lease.get("active"):
+            raise TerminalError("Strict reuse-existing refused: terminal input is busy.")
+        self.wait_until_ready(session_id)
+        activity = self._codex_turn_activity(session)
+        if activity.get("active"):
+            raise TerminalError("Strict reuse-existing refused: terminal session is busy with a Codex turn.")
+        return self._load(session_id)
+
+    def send(self, session_id: str, message: str, *, lease_owner: str = "") -> dict[str, Any]:
         session = self._load(session_id)
         self.wait_until_ready(session_id)
         transport_metadata: dict[str, Any] = {}
@@ -1014,27 +1265,40 @@ class TerminalManager:
         baseline_output = self.read(session_id, 1000)
         cursor = self.turn_cursor(session_id)
         submitted_at = time.time()
+        writer = validate_lease_owner(lease_owner or f"automation:{uuid4().hex[:16]}")
         text_write_started = time.monotonic()
-        _pipe_request(session.pipe, {"op": "send_text", "message": message_to_send})
+        send_result = _pipe_request(
+            session.pipe,
+            {"op": "send_text", "message": message_to_send, "writer": writer, "auto_lease": not bool(lease_owner)},
+        )
         text_write_completed = time.monotonic()
-        composer_ack = self.wait_for_composer_ack(
-            session_id,
-            marker=marker,
-            baseline_output=baseline_output,
-        )
-        composer_acknowledged = time.monotonic()
-        remaining_debounce = TERMINAL_SUBMIT_DELAY_SECONDS - (composer_acknowledged - text_write_completed)
-        if remaining_debounce > 0:
-            time.sleep(remaining_debounce)
-        enter_write_started = time.monotonic()
-        _pipe_request(session.pipe, {"op": "submit"})
-        enter_write_completed = time.monotonic()
-        evidence = self.wait_until_turn_started(
-            session_id,
-            cursor=cursor,
-            baseline_output=baseline_output,
-            submitted_at=submitted_at,
-        )
+        auto_lease = bool(send_result.get("lease_acquired")) and not lease_owner
+        try:
+            composer_ack = self.wait_for_composer_ack(
+                session_id,
+                marker=marker,
+                baseline_output=baseline_output,
+            )
+            composer_acknowledged = time.monotonic()
+            remaining_debounce = TERMINAL_SUBMIT_DELAY_SECONDS - (composer_acknowledged - text_write_completed)
+            if remaining_debounce > 0:
+                time.sleep(remaining_debounce)
+            enter_write_started = time.monotonic()
+            submit_payload: dict[str, Any] = {"op": "submit"}
+            if lease_owner:
+                submit_payload["writer"] = writer
+            _pipe_request(session.pipe, submit_payload)
+            enter_write_completed = time.monotonic()
+            evidence = self.wait_until_turn_started(
+                session_id,
+                cursor=cursor,
+                baseline_output=baseline_output,
+                submitted_at=submitted_at,
+            )
+        except Exception:
+            if auto_lease:
+                self.release_input_lease(session_id, writer)
+            raise
         turn_start_observed = time.monotonic()
         evidence["terminal_input_sequence"] = "text_then_carriage_return"
         evidence["composer_ack"] = composer_ack
@@ -1057,16 +1321,128 @@ class TerminalManager:
         evidence["composer_marker"] = marker
         evidence["enter_sent"] = True
         evidence["resend_attempted"] = False
+        evidence["input_writer"] = lease_owner or writer
         evidence.update(transport_metadata)
+        if auto_lease:
+            self.release_input_lease(session_id, writer)
         return evidence
+
+    def acquire_input_lease(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        mode: str = "automation",
+        ttl_seconds: float = 900.0,
+    ) -> dict[str, Any]:
+        owner = validate_lease_owner(owner)
+        if mode not in {"automation", "human"}:
+            raise TerminalError("Terminal input lease mode is invalid.")
+        ttl = float(ttl_seconds)
+        if ttl <= 0 or ttl > 3600:
+            raise TerminalError("Terminal input lease TTL is outside the safe range.")
+        session = self._load(session_id)
+        return _pipe_request(
+            session.pipe,
+            {"op": "acquire_input_lease", "owner": owner, "mode": mode, "ttl_ms": int(ttl * 1000)},
+        )
+
+    def renew_input_lease(self, session_id: str, owner: str, *, ttl_seconds: float = 900.0) -> dict[str, Any]:
+        owner = validate_lease_owner(owner)
+        ttl = float(ttl_seconds)
+        if ttl <= 0 or ttl > 3600:
+            raise TerminalError("Terminal input lease TTL is outside the safe range.")
+        session = self._load(session_id)
+        return _pipe_request(session.pipe, {"op": "renew_input_lease", "owner": owner, "ttl_ms": int(ttl * 1000)})
+
+    def release_input_lease(self, session_id: str, owner: str) -> dict[str, Any]:
+        owner = validate_lease_owner(owner)
+        session = self._load(session_id)
+        return _pipe_request(session.pipe, {"op": "release_input_lease", "owner": owner})
+
+    def begin_automation_turn(self, session_id: str, owner: str = "") -> str:
+        owner = validate_lease_owner(owner or f"automation:{uuid4().hex[:16]}")
+        self.acquire_input_lease(session_id, owner, mode="automation")
+        return owner
 
     def read(self, session_id: str, lines: int = 80) -> str:
         session = self._load(session_id)
+        if not isinstance(lines, int) or lines < 1 or lines > 1000:
+            raise TerminalError("Terminal snapshot line count is outside the safe range.")
         return str(_pipe_request(session.pipe, {"op": "read", "lines": lines}).get("output", ""))
+
+    def read_since(
+        self,
+        session_id: str,
+        cursor: int = 0,
+        *,
+        max_bytes: int = TERMINAL_LIVE_READ_MAX_BYTES,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise TerminalError("Live output cursor must be a non-negative integer.")
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 1 <= max_bytes <= TERMINAL_LIVE_READ_MAX_BYTES:
+            raise TerminalError("Live output read size is outside the safe range.")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise TerminalError("Live output cursor offset must be a non-negative integer.")
+        session = self._load(session_id)
+        return _pipe_request(
+            session.pipe,
+            {"op": "read_since", "since": cursor, "max_bytes": max_bytes, "offset": offset},
+        )
+
+    def live_cursor(self, session_id: str) -> int:
+        return int(self.read_since(session_id, 0, max_bytes=1).get("next_seq", 0))
+
+    def write_input(self, session_id: str, data: str, owner: str) -> dict[str, Any]:
+        owner = validate_lease_owner(owner)
+        if not isinstance(data, str) or not data or len(data.encode("utf-8")) > TERMINAL_INPUT_MAX_BYTES:
+            raise TerminalError("Raw terminal input is empty or exceeds the safe limit.")
+        if "\x00" in data:
+            raise TerminalError("Raw terminal input contains NUL.")
+        session = self._load(session_id)
+        return _pipe_request(session.pipe, {"op": "write_input", "owner": owner, "data": data})
+
+    def attach_snapshot(self, session_id: str, lines: int = 80) -> str:
+        """Backward-compatible non-destructive snapshot attach."""
+        return self.read(session_id, lines)
+
+    def attach_interactive(self, session_id: str, *, poll_seconds: float = 0.05) -> dict[str, Any]:
+        """Return attach identity; the CLI owns the console loop and detaches safely."""
+        session = self._load(session_id)
+        status = self.status(session_id)
+        if status.get("state") != "running":
+            raise TerminalError(f"Cannot attach to terminal session in state {status.get('state')}.")
+        owner = validate_lease_owner(f"human:{uuid4().hex[:16]}")
+        viewer_only = False
+        try:
+            self.acquire_input_lease(session_id, owner, mode="human", ttl_seconds=3600)
+        except TerminalError as exc:
+            if "busy" not in str(exc).casefold() and "lease" not in str(exc).casefold():
+                raise
+            viewer_only = True
+        return {
+            "session": session,
+            "owner": owner,
+            "viewer_only": viewer_only,
+            "poll_seconds": max(0.02, min(float(poll_seconds), 1.0)),
+        }
+
+    def detach_interactive(self, session_id: str, owner: str) -> None:
+        try:
+            self.release_input_lease(session_id, owner)
+        except TerminalError:
+            pass
 
     def turn_cursor(self, session_id: str) -> tuple[Path | None, int]:
         session = self._load(session_id)
-        discovered = find_session_file(session.codex_home, session.repository, after=time.time() - 30)
+        codex_session_id = str(getattr(session, "codex_session_id", "") or "")
+        discovered = find_session_file(
+            session.codex_home,
+            session.repository,
+            after=0.0 if codex_session_id else time.time() - 30,
+            codex_session_id=codex_session_id,
+        )
         if not discovered:
             return None, 0
         path, _ = discovered
@@ -1084,18 +1460,34 @@ class TerminalManager:
         progress: Any = None,
     ) -> dict[str, str]:
         session = self._load(session_id)
-        discovered = find_session_file(session.codex_home, session.repository, after=time.time() - 30)
-        session_path = (cursor[0] if cursor else None) or (discovered[0] if discovered else None)
-        session_id_from_codex = discovered[1] if discovered else ""
-        offset = cursor[1] if cursor else (session_path.stat().st_size if session_path and session_path.exists() else 0)
+        expected_codex_session_id = str(getattr(session, "codex_session_id", "") or "")
+
+        def discover() -> tuple[Path, str] | None:
+            return find_session_file(
+                session.codex_home,
+                session.repository,
+                after=0.0 if expected_codex_session_id else time.time() - 30,
+                codex_session_id=expected_codex_session_id,
+            )
+
+        cursor_path, cursor_offset = cursor or (None, 0)
+        discovered = discover()
+        if expected_codex_session_id:
+            session_path = discovered[0] if discovered else None
+        else:
+            session_path = cursor_path or (discovered[0] if discovered else None)
+        session_id_from_codex = expected_codex_session_id or (discovered[1] if discovered else "")
+        offset = cursor_offset if cursor_path == session_path else (
+            session_path.stat().st_size if cursor is None and session_path and session_path.exists() else 0
+        )
         started = time.monotonic()
         last_progress = started
         while time.monotonic() - started < timeout:
             if session_path is None or not session_path.exists():
-                discovered = find_session_file(session.codex_home, session.repository, after=time.time() - 30)
+                discovered = discover()
                 if discovered:
                     session_path, session_id_from_codex = discovered
-                    offset = 0
+                    offset = cursor_offset if cursor_path == session_path else 0
             if session_path and session_path.exists():
                 state, assistant = session_turn_state(session_path, offset)
                 if state == "completed":

@@ -12,12 +12,16 @@ import time
 from typing import Any, Callable
 
 from .config import AgentConfig, OrchestratorConfig
+from .live_events import LiveEventJournal
 from .process import CommandResult, _prepare_command, codex_environment
 from .report import atomic_write_json
 
 
 class AppServerError(RuntimeError):
     """Raised when the local Codex App Server cannot complete a safe request."""
+
+
+_EVENT_PUBLICATION_QUEUE_SIZE = 64
 
 
 def _report_object(message: str) -> dict[str, Any] | None:
@@ -124,6 +128,12 @@ class _AppServerProcess:
         self._pending: deque[dict[str, Any]] = deque()
         self._stderr: deque[str] = deque(maxlen=80)
         self._events: deque[dict[str, Any]] = deque(maxlen=2000)
+        self._event_journal: LiveEventJournal | None = None
+        self._event_context: dict[str, str] = {}
+        self._event_publications: queue.Queue[
+            tuple[LiveEventJournal, str, dict[str, Any], dict[str, str]] | None
+        ] = queue.Queue(maxsize=_EVENT_PUBLICATION_QUEUE_SIZE)
+        self._event_publication_stop = threading.Event()
         self._closed = False
         command = [config.codex_command, "app-server", "--stdio"]
         process_args, use_shell = _prepare_command([str(item) for item in command])
@@ -141,6 +151,7 @@ class _AppServerProcess:
             bufsize=1,
             shell=use_shell,
         )
+        threading.Thread(target=self._publish_events, name="dual-codex-event-journal", daemon=True).start()
         threading.Thread(target=self._read_stdout, name="dual-codex-app-server", daemon=True).start()
         threading.Thread(target=self._read_stderr, name="dual-codex-app-server-stderr", daemon=True).start()
         try:
@@ -174,6 +185,31 @@ class _AppServerProcess:
     def events(self) -> list[dict[str, Any]]:
         return list(self._events)
 
+    def set_event_context(self, journal: LiveEventJournal | None, **context: str) -> None:
+        with self._lock:
+            self._event_journal = journal
+            self._event_context = {str(key): str(value) for key, value in context.items()}
+
+    def request_without_event_journal(
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        *,
+        timeout: float,
+    ) -> dict[str, Any]:
+        """Run dashboard telemetry without inheriting an Executor event context."""
+
+        with self._lock:
+            previous_journal = self._event_journal
+            previous_context = self._event_context
+            self._event_journal = None
+            self._event_context = {}
+            try:
+                return self.request(method, params, timeout=timeout)
+            finally:
+                self._event_journal = previous_journal
+                self._event_context = previous_context
+
     def _read_stdout(self) -> None:
         assert self.process.stdout is not None
         for line in self.process.stdout:
@@ -184,6 +220,26 @@ class _AppServerProcess:
         assert self.process.stderr is not None
         for line in self.process.stderr:
             self._stderr.append(line)
+
+    def _publish_events(self) -> None:
+        stop = getattr(self, "_event_publication_stop", None)
+        while True:
+            try:
+                publication = self._event_publications.get(timeout=0.1)
+            except queue.Empty:
+                if stop is not None and stop.is_set():
+                    return
+                continue
+            if publication is None:
+                return
+            journal, method, params, context = publication
+            try:
+                journal.append_notification(method, params, **context)
+            except Exception:
+                # Journal contention/failure must not affect protocol handling.
+                pass
+            if stop is not None and stop.is_set() and self._event_publications.empty():
+                return
 
     def _send(self, message: dict[str, Any]) -> None:
         if self._closed or self.process.poll() is not None:
@@ -239,6 +295,24 @@ class _AppServerProcess:
     def _record_notification(self, message: dict[str, Any]) -> None:
         if "method" in message:
             self._events.append(message)
+            journal = getattr(self, "_event_journal", None)
+            publications = getattr(self, "_event_publications", None)
+            if journal is not None and publications is not None:
+                try:
+                    publications.put_nowait(
+                        (
+                            journal,
+                            str(message.get("method", "")),
+                            message.get("params") if isinstance(message.get("params"), dict) else {},
+                            dict(getattr(self, "_event_context", {})),
+                        )
+                    )
+                except queue.Full:
+                    # A bounded queue prevents observability from backpressuring RPC.
+                    pass
+                except Exception:
+                    # Observability must not change the executor's protocol behavior.
+                    pass
 
     def request(self, method: str, params: dict[str, Any] | None, *, timeout: float) -> dict[str, Any]:
         with self._lock:
@@ -387,6 +461,13 @@ class _AppServerProcess:
         if self._closed:
             return
         self._closed = True
+        stop = getattr(self, "_event_publication_stop", None)
+        if stop is not None:
+            stop.set()
+        try:
+            self._event_publications.put_nowait(None)
+        except (queue.Full, AttributeError):
+            pass
         try:
             if self.process.stdin:
                 self.process.stdin.close()
@@ -503,6 +584,9 @@ def run_codex_app_server(
     session_id: str,
     task_artifact_path: Path | None = None,
     task_sha256: str = "",
+    request_id: str = "",
+    run_id: str = "",
+    role: str = "executor",
     progress: Callable[[str], None] | None = None,
 ) -> CommandResult:
     command = [config.codex_command, "app-server", "--stdio"]
@@ -512,9 +596,38 @@ def run_codex_app_server(
         "task_artifact": str(task_artifact_path.resolve()) if task_artifact_path else "",
         "task_sha256": task_sha256,
     }
+    journal: LiveEventJournal | None = None
+    try:
+        journal = LiveEventJournal(
+            config.runs_dir,
+            account=agent.account_name,
+            role=role,
+            repository=repository,
+            run_id=run_id or session_id,
+            request_id=request_id,
+            max_records=config.live_event_journal_max_records,
+            max_record_bytes=config.live_event_journal_max_record_bytes,
+            max_detail_bytes=config.live_event_journal_max_detail_bytes,
+        )
+        metadata["live_event_journal"] = str(journal.path)
+    except Exception:
+        # A telemetry path/configuration failure must not block the Executor.
+        journal = None
     process: _AppServerProcess | None = None
     try:
         process = _get_process(config, agent, repository, progress)
+        set_context = getattr(process, "set_event_context", None)
+        if callable(set_context):
+            if journal is not None:
+                set_context(
+                    journal,
+                    run_id=run_id or session_id,
+                    request_id=request_id,
+                    account=agent.account_name,
+                    role=role,
+                )
+            else:
+                set_context(None)
         thread_id, resumed = process.thread_id_for(repository)
         turn = process.turn(thread_id, prompt)
         assistant = turn["assistant"]
@@ -553,11 +666,22 @@ def app_server_call(
     process: _AppServerProcess | None = None
     try:
         process = _get_process(config, agent, repository, None)
-        response = process.request(
-            method,
-            params,
-            timeout=timeout or config.dashboard_telemetry_timeout,
-        )
+        telemetry_call = getattr(type(process), "request_without_event_journal", None)
+        if callable(telemetry_call):
+            response = process.request_without_event_journal(
+                method,
+                params,
+                timeout=timeout or config.dashboard_telemetry_timeout,
+            )
+        else:
+            set_context = getattr(process, "set_event_context", None)
+            if callable(set_context):
+                set_context(None)
+            response = process.request(
+                method,
+                params,
+                timeout=timeout or config.dashboard_telemetry_timeout,
+            )
         if "error" in response:
             return {"error": {"message": _error_message(response)}}
         result = response.get("result")

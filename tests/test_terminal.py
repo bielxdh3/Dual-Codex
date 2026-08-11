@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -24,7 +27,9 @@ from dual_codex.terminal import (
     session_turn_started,
     session_turn_state,
     _rollout_snapshot,
+    executor_task_artifact_dir,
     validate_control_message,
+    validate_pipe_name,
     validate_session_id,
 )
 
@@ -69,6 +74,228 @@ class TerminalTests(unittest.TestCase):
         with self.assertRaises(TerminalError):
             validate_session_id("../escape")
         self.assertRegex(session_id_for("biel4", Path("C:/Work Tree")), r"^biel4-[a-f0-9]{12}$")
+
+    def test_named_pipe_is_session_bound_and_rejects_external_shapes(self) -> None:
+        pipe = r"\\.\pipe\dual-codex-biel4-session-aaaaaaaaaaaaaaaa"
+        self.assertEqual(validate_pipe_name(pipe, session_id="biel4-session"), pipe)
+        with self.assertRaises(TerminalError):
+            validate_pipe_name(r"\\.\pipe\other-service-biel4-session")
+        with self.assertRaises(TerminalError):
+            validate_pipe_name(pipe, session_id="biel3-session")
+
+    def test_live_read_since_uses_monotonic_cursor_and_bounded_size(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        session = SimpleNamespace(pipe=r"\\.\pipe\dual-codex-biel4-session-aaaaaaaaaaaaaaaa")
+        captured: list[dict[str, object]] = []
+
+        def request(_pipe: str, payload: dict[str, object]) -> dict[str, object]:
+            captured.append(payload)
+            return {"ok": True, "output": "new", "next_seq": 4, "oldest_seq": 2, "behind_cursor": False}
+
+        with patch.object(manager, "_load", return_value=session), patch(
+            "dual_codex.terminal._pipe_request", side_effect=request
+        ):
+            result = manager.read_since("biel4-session", 3, max_bytes=128)
+        self.assertEqual(result["next_seq"], 4)
+        self.assertEqual(
+            captured,
+            [{"op": "read_since", "since": 3, "max_bytes": 128, "offset": 0}],
+        )
+        with self.assertRaises(TerminalError):
+            manager.read_since("biel4-session", 3, max_bytes=0)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the ConPTY host regression")
+    def test_pty_live_cursor_replays_utf8_record_suffix(self) -> None:
+        source = (Path(__file__).parents[1] / "scripts" / "pty-host.js").read_text(encoding="utf-8")
+        script = f"""
+const source = {json.dumps(source)};
+const start = source.indexOf("function utf8PrefixLength");
+const end = source.indexOf("function leaseSnapshot");
+let output = [{{seq: 1, text: "A\\u00e9B"}}];
+const nextSequence = 2;
+eval(source.slice(start, end));
+let packet = liveOutput(0, 2);
+if (packet.output !== "A" || packet.next_seq !== 1 || packet.next_offset !== 1) throw new Error(JSON.stringify(packet));
+packet = liveOutput(packet.next_seq, 2, packet.next_offset);
+if (packet.output !== "\\u00e9" || packet.next_seq !== 1 || packet.next_offset !== 3) throw new Error(JSON.stringify(packet));
+packet = liveOutput(packet.next_seq, 2, packet.next_offset);
+if (packet.output !== "B" || packet.next_seq !== 1 || packet.next_offset !== 0) throw new Error(JSON.stringify(packet));
+"""
+        result = subprocess.run([shutil.which("node") or "node", "-"], input=script, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_strict_reuse_requires_registered_identity_and_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            codex_home = root / "codex-home"
+            repository.mkdir()
+            codex_home.mkdir()
+            config = _config(root, repository)
+            transport = executor_task_artifact_dir(config, create=True)
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            session_id = "executor-session"
+            record = config.runs_dir / "terminal-sessions" / f"{session_id}.json"
+            record.parent.mkdir(parents=True)
+            record.write_text("{}", encoding="utf-8")
+            session = SimpleNamespace(
+                session_id=session_id,
+                session_file=str(record.resolve()),
+                account="executor",
+                role="executor",
+                repository=repository,
+                codex_home=codex_home,
+                add_dirs=(transport,),
+                pipe=r"\\.\pipe\dual-codex-executor-session-aaaaaaaaaaaaaaaa",
+                process_start_identity="start",
+                process_epoch="epoch",
+                pid=123,
+                task_artifact_dir=transport,
+            )
+            agent = AgentConfig(
+                codex_home=codex_home,
+                model="manual-model",
+                reasoning_effort="manual-reasoning",
+                sandbox="workspace-write",
+                account_name="executor",
+                label="Executor",
+                backend="windows",
+            )
+            status = {
+                "state": "running",
+                "identity_match": True,
+                "host_pid": 123,
+                "process_epoch": "epoch",
+                "input_lease": {"active": False},
+            }
+            with patch.object(manager, "_load", return_value=session), patch.object(
+                manager, "status", return_value=status
+            ), patch.object(manager, "wait_until_ready"), patch.object(
+                manager, "_codex_turn_activity", return_value={"active": False}
+            ):
+                self.assertIs(
+                    manager.reuse_existing(
+                        session_id=session_id,
+                        agent=agent,
+                        role="executor",
+                        repository=repository,
+                        add_dirs=(transport,),
+                    ),
+                    session,
+                )
+                with self.assertRaisesRegex(TerminalError, "task transport"):
+                    manager.reuse_existing(
+                        session_id=session_id,
+                        agent=agent,
+                        role="executor",
+                        repository=repository,
+                        add_dirs=(root / "other",),
+                    )
+                with self.assertRaisesRegex(TerminalError, "account or role"):
+                    manager.reuse_existing(
+                        session_id=session_id,
+                        agent=replace(agent, account_name="architect"),
+                        role="executor",
+                        repository=repository,
+                        add_dirs=(transport,),
+                    )
+                session.task_artifact_dir = None
+                with self.assertRaisesRegex(TerminalError, "registration is missing"):
+                    manager.reuse_existing(
+                        session_id=session_id,
+                        agent=agent,
+                        role="executor",
+                        repository=repository,
+                        add_dirs=(transport,),
+                    )
+
+    def test_executor_transport_rejects_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            outside = root / "outside"
+            repository.mkdir()
+            outside.mkdir()
+            config = _config(root, repository)
+            transport = config.runs_dir / "executor-task-artifacts"
+            transport.parent.mkdir(parents=True)
+            try:
+                transport.symlink_to(outside, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlinks are unavailable: {exc}")
+            with self.assertRaisesRegex(TerminalError, "symlink"):
+                executor_task_artifact_dir(config, create=True)
+
+    def test_executor_transport_rejects_non_directory_substitution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            repository.mkdir()
+            config = _config(root, repository)
+            transport = config.runs_dir / "executor-task-artifacts"
+            transport.parent.mkdir(parents=True)
+            transport.write_text("not a directory", encoding="utf-8")
+            with self.assertRaisesRegex(TerminalError, "not a directory"):
+                executor_task_artifact_dir(config)
+
+    def test_non_executor_cannot_register_parent_of_executor_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            repository.mkdir()
+            config = _config(root, repository)
+            executor_task_artifact_dir(config, create=True)
+            agent = AgentConfig(
+                codex_home=root / "architect profile",
+                model="",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="architect",
+                backend="windows",
+            )
+            manager = TerminalManager(config)
+            with self.assertRaisesRegex(TerminalError, "Non-Executor"):
+                manager.start(
+                    session_id="architect-test",
+                    agent=agent,
+                    role="architect",
+                    repository=repository,
+                    add_dirs=(config.runs_dir,),
+                )
+
+    def test_strict_reuse_refuses_missing_or_busy_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            repository.mkdir()
+            config = _config(root, repository)
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            agent = AgentConfig(
+                codex_home=root / "codex-home",
+                model="",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="executor",
+                backend="windows",
+            )
+            with self.assertRaisesRegex(TerminalError, "no registered"):
+                manager.reuse_existing(
+                    session_id="missing",
+                    agent=agent,
+                    role="executor",
+                    repository=repository,
+                )
+
+    def test_raw_input_requires_named_writer(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        session = SimpleNamespace(pipe=r"\\.\pipe\dual-codex-biel4-session-aaaaaaaaaaaaaaaa")
+        with patch.object(manager, "_load", return_value=session), patch(
+            "dual_codex.terminal._pipe_request", return_value={"ok": True}
+        ) as request:
+            manager.write_input("biel4-session", "\x1b[A", "human:viewer")
+        self.assertEqual(request.call_args.args[1], {"op": "write_input", "owner": "human:viewer", "data": "\x1b[A"})
 
     def test_session_id_is_stable_and_scoped_to_account_and_repository(self) -> None:
         same_path_a = Path(r"C:\Work Tree\target")
@@ -149,7 +376,59 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(detector.feed(normal), detector.NOT_READY)
         self.assertEqual(detector.feed(normal), detector.READY)
         self.assertTrue(detector.seen_placeholder)
-        self.assertEqual(detector.ready_evidence, "stable Codex banner/model/directory/composer markers")
+        self.assertEqual(detector.ready_evidence, "stable Codex model/directory/composer markers")
+
+    def test_readiness_accepts_prompt_before_or_after_footer(self) -> None:
+        footer = (
+            "│ model:     gpt-5.6-sol   /model to change   │\n"
+            "│ directory: C:\\target                      │\n"
+            "╰───────\n"
+        )
+        prompt = "› Improve documentation in @filename\n"
+        for tail in (prompt + footer, footer + prompt):
+            with self.subTest(prompt_first=tail.startswith(prompt)):
+                detector = TuiReadinessDetector()
+                self.assertNotIn("OpenAI Codex", tail)
+                self.assertEqual(detector.feed(tail), detector.NOT_READY)
+                self.assertEqual(detector.feed(tail), detector.READY)
+                self.assertTrue(detector.seen_model_ready)
+
+    def test_readiness_accepts_real_unlabeled_model_directory_footer_in_either_order(self) -> None:
+        footer = "gpt-5.6-sol high · ~\\3D Objects\\Dual-Codex-worktree\n"
+        prompt = "› Improve documentation in @filename\n"
+        self.assertNotIn("model:", footer)
+        self.assertNotIn("directory:", footer)
+        for tail in (prompt + footer, footer + prompt):
+            with self.subTest(prompt_first=tail.startswith(prompt)):
+                detector = TuiReadinessDetector()
+                self.assertEqual(detector.feed(tail), detector.NOT_READY)
+                self.assertEqual(detector.feed(tail), detector.READY)
+                self.assertTrue(detector.seen_model_ready)
+
+    def test_readiness_rejects_ambiguous_post_turn_tail(self) -> None:
+        detector = TuiReadinessDetector()
+        ambiguous = (
+            "│ model:     gpt-5.6-sol   /model to change   │\n"
+            "│ directory: C:\\first                       │\n"
+            "› Improve documentation in @filename\n"
+            "│ directory: C:\\second                      │\n"
+        )
+        self.assertEqual(detector.feed(ambiguous), detector.NOT_READY)
+        self.assertEqual(detector.feed(ambiguous), detector.NOT_READY)
+        self.assertFalse(detector.seen_ready)
+
+    def test_readiness_rejects_missing_current_marker(self) -> None:
+        samples = (
+            "│ model:     gpt-5.6-sol\n│ directory: C:\\target\n",
+            "› Improve documentation in @filename\n│ directory: C:\\target\n",
+            "› Improve documentation in @filename\n│ model:     gpt-5.6-sol\n",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                detector = TuiReadinessDetector()
+                self.assertEqual(detector.feed(sample), detector.NOT_READY)
+                self.assertEqual(detector.feed(sample), detector.NOT_READY)
+                self.assertFalse(detector.seen_ready)
 
     def test_readiness_handles_partial_ansi_and_trust_setup(self) -> None:
         setup = TuiReadinessDetector()
@@ -215,6 +494,93 @@ class TerminalTests(unittest.TestCase):
             self.assertEqual(found, (path, "codex-1"))
             self.assertEqual(session_turn_started(path), "task_started")
             self.assertEqual(session_turn_state(path), ("completed", "done"))
+
+    def test_persistent_turn_cursor_uses_registered_session_beyond_recent_window(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            sessions = root / "sessions" / "2026" / "08" / "10"
+            repository.mkdir()
+            sessions.mkdir(parents=True)
+            associated = sessions / "rollout-associated.jsonl"
+            unrelated = sessions / "rollout-unrelated.jsonl"
+            associated.write_text(
+                json.dumps({"type": "session_meta", "payload": {"session_id": "persistent", "cwd": str(repository)}})
+                + "\n"
+                + json.dumps({"type": "event_msg", "payload": {"type": "turn_completed"}})
+                + "\n",
+                encoding="utf-8",
+            )
+            old_mtime = associated.stat().st_mtime - 60
+            os.utime(associated, (old_mtime, old_mtime))
+            unrelated.write_text(
+                json.dumps({"type": "session_meta", "payload": {"session_id": "unrelated", "cwd": str(repository)}})
+                + "\n",
+                encoding="utf-8",
+            )
+            manager = TerminalManager.__new__(TerminalManager)
+            manager._load = lambda _session_id: SimpleNamespace(
+                codex_home=root,
+                repository=repository,
+                codex_session_id="persistent",
+            )
+
+            cursor = manager.turn_cursor("executor-session")
+            self.assertEqual(cursor, (associated, associated.stat().st_size))
+
+            with associated.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
+                stream.write(
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"text": "second turn"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+                stream.write(json.dumps({"type": "event_msg", "payload": {"type": "turn_completed"}}) + "\n")
+            os.utime(associated, (old_mtime, old_mtime))
+
+            result = manager.wait_for_turn("executor-session", cursor=cursor, timeout=0.1)
+
+            self.assertEqual(result["assistant"], "second turn")
+            self.assertEqual(result["session_id"], "persistent")
+            self.assertEqual(result["session_file"], str(associated))
+
+    def test_registered_session_cursor_rejects_missing_and_unrelated_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            sessions = root / "sessions" / "2026" / "08" / "10"
+            repository.mkdir()
+            sessions.mkdir(parents=True)
+            manager = TerminalManager.__new__(TerminalManager)
+            manager._load = lambda _session_id: SimpleNamespace(
+                codex_home=root,
+                repository=repository,
+                codex_session_id="missing",
+            )
+
+            self.assertEqual(manager.turn_cursor("executor-session"), (None, 0))
+            with self.assertRaisesRegex(TerminalError, "Timed out"):
+                manager.wait_for_turn("executor-session", cursor=(None, 0), timeout=0)
+
+            unrelated = sessions / "rollout-unrelated.jsonl"
+            unrelated.write_text(
+                json.dumps({"type": "session_meta", "payload": {"session_id": "unrelated", "cwd": str(repository)}})
+                + "\n"
+                + json.dumps({"type": "event_msg", "payload": {"type": "turn_completed"}})
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(manager.turn_cursor("executor-session"), (None, 0))
+            with self.assertRaisesRegex(TerminalError, "Timed out"):
+                manager.wait_for_turn("executor-session", cursor=(unrelated, 0), timeout=0)
 
     def test_historical_active_rollout_is_ignored_without_mutating_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -530,12 +896,12 @@ class TerminalTests(unittest.TestCase):
 
     def test_start_sets_account_home_and_rejects_duplicate_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            root = Path(temp) / "root with spaces"
+            root.mkdir()
             repository = root / "repo"
             repository.mkdir()
-            artifact_dir = root / "task artifacts"
-            artifact_dir.mkdir()
             config = _config(root, repository)
+            artifact_dir = config.runs_dir / "executor-task-artifacts"
             agent = AgentConfig(
                 codex_home=root / "executor profile",
                 model="",
@@ -574,8 +940,13 @@ class TerminalTests(unittest.TestCase):
                 )
                 self.assertEqual(session.account, "biel4")
                 self.assertEqual(session.add_dirs, (artifact_dir.resolve(),))
+                self.assertEqual(session.task_artifact_dir, artifact_dir.resolve())
                 command = [str(item) for item in popen.call_args.args[0]]
                 self.assertEqual(command[command.index("--add-dir") + 1], str(artifact_dir.resolve()))
+                record = json.loads(Path(session.session_file).read_text(encoding="utf-8"))
+                self.assertEqual(record["task_artifact_dir"], str(artifact_dir.resolve()))
+                listed = manager.list()
+                self.assertEqual(listed[0]["task_artifact_dir"], str(artifact_dir.resolve()))
                 self.assertEqual(popen.call_args.kwargs["env"]["CODEX_HOME"], str(agent.codex_home))
                 self.assertNotIn("OPENAI_API_KEY", popen.call_args.kwargs["env"])
                 self.assertNotIn("exec", [str(item) for item in popen.call_args.args[0]])
