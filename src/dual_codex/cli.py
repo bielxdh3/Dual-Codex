@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import AbstractContextManager
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -29,6 +31,138 @@ from .registry import (
     unassign_role,
 )
 from .dashboard import DashboardServer
+
+
+_ENABLE_PROCESSED_OUTPUT = 0x0001
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_DISABLE_NEWLINE_AUTO_RETURN = 0x0008
+_ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+
+
+class _VtKeyBuffer:
+    def __init__(self, timeout: float = 0.05):
+        self._timeout = timeout
+        self._pending = ""
+        self._started = 0.0
+
+    def feed(self, key: str, *, now: float | None = None) -> tuple[str, ...]:
+        if not self._pending:
+            if key != "\x1b":
+                return (key,)
+            self._pending = key
+            self._started = time.monotonic() if now is None else now
+            return ()
+        self._pending += key
+        self._started = time.monotonic() if now is None else now
+        if self._complete() or len(self._pending) >= 64:
+            return self.flush(force=True)
+        return ()
+
+    def flush(self, *, force: bool = False, now: float | None = None) -> tuple[str, ...]:
+        if not self._pending:
+            return ()
+        current = time.monotonic() if now is None else now
+        if not force and current - self._started < self._timeout:
+            return ()
+        pending, self._pending = self._pending, ""
+        return (pending,)
+
+    def _complete(self) -> bool:
+        if len(self._pending) < 2:
+            return False
+        if self._pending[1] not in "[O":
+            return True
+        return len(self._pending) >= 3 and "@" <= self._pending[-1] <= "~"
+
+
+class _WindowsConsoleModes(AbstractContextManager["_WindowsConsoleModes"]):
+    def __init__(self, handles, get_mode, set_mode):
+        self._handles = handles
+        self._get_mode = get_mode
+        self._set_mode = set_mode
+        self._original: list[tuple[int, int]] = []
+
+    def __enter__(self) -> "_WindowsConsoleModes":
+        try:
+            for handle, required in self._handles:
+                mode = self._get_mode(handle)
+                self._original.append((handle, mode))
+                self._set_mode(handle, mode | required)
+        except BaseException:
+            self._restore()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        try:
+            self._restore()
+        except TerminalError:
+            if exc_type is None:
+                raise
+        return False
+
+    def _restore(self) -> None:
+        failure = None
+        while self._original:
+            handle, mode = self._original.pop()
+            try:
+                self._set_mode(handle, mode)
+            except TerminalError as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+
+def _windows_vt_console(stdin, stdout) -> _WindowsConsoleModes:
+    if not stdin.isatty() or not stdout.isatty():
+        raise TerminalError("Interactive attach requires console stdin and stdout; redirection is not supported.")
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetConsoleMode.restype = wintypes.BOOL
+    kernel32.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.SetConsoleMode.restype = wintypes.BOOL
+
+    def get_mode(handle: int) -> int:
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(wintypes.HANDLE(handle), ctypes.byref(mode)):
+            raise TerminalError(f"Could not read Windows console mode (error {ctypes.get_last_error()}).")
+        return int(mode.value)
+
+    def set_mode(handle: int, mode: int) -> None:
+        if not kernel32.SetConsoleMode(wintypes.HANDLE(handle), wintypes.DWORD(mode)):
+            raise TerminalError(f"Could not configure Windows console mode (error {ctypes.get_last_error()}).")
+
+    return _WindowsConsoleModes(
+        (
+            (msvcrt.get_osfhandle(stdin.fileno()), _ENABLE_VIRTUAL_TERMINAL_INPUT),
+            (
+                msvcrt.get_osfhandle(stdout.fileno()),
+                _ENABLE_PROCESSED_OUTPUT
+                | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+                | _DISABLE_NEWLINE_AUTO_RETURN,
+            ),
+        ),
+        get_mode,
+        set_mode,
+    )
+
+
+def _write_terminal_output(stream, text: str) -> None:
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        raise TerminalError("Interactive attach stdout has no binary console buffer.")
+    buffer.write(text.encode("utf-8"))
+    buffer.flush()
+
+
+def _console_size(stream) -> tuple[int, int]:
+    size = os.get_terminal_size(stream.fileno())
+    return max(20, min(size.columns, 500)), max(5, min(size.lines, 200))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -321,42 +455,60 @@ def _interactive_attach(manager: TerminalManager, session_id: str) -> None:
         raise TerminalError("Interactive ConPTY attach requires Windows.")
     import msvcrt
 
-    attached = manager.attach_interactive(session_id)
-    owner = str(attached["owner"])
-    cursor = 0
-    offset = 0
-    try:
-        if attached["viewer_only"]:
-            print("Attached viewer-only: terminal input is leased by automation.", file=sys.stderr, flush=True)
-        print("Interactive attach active; press Ctrl-] to detach safely.", file=sys.stderr, flush=True)
-        while manager.status(session_id).get("state") == "running":
-            packet = manager.read_since(session_id, cursor, offset=offset)
-            if packet.get("behind_cursor"):
-                print("[live output cursor fell behind; replaying retained output]", file=sys.stderr, flush=True)
-                cursor = max(0, int(packet.get("oldest_seq", 1)) - 1)
-                offset = 0
-                continue
-            text = str(packet.get("output", ""))
-            if text:
-                print(text, end="", flush=True)
-            cursor = int(packet.get("next_seq", cursor))
-            offset = int(packet.get("next_offset", 0))
-            while msvcrt.kbhit():
-                key = msvcrt.getwch()
-                if key == "\x1d":
-                    return
-                if key in {"\x00", "\xe0"}:
-                    extended = msvcrt.getwch()
-                    key = {"H": "\x1b[A", "P": "\x1b[B", "K": "\x1b[D", "M": "\x1b[C"}.get(extended, "")
-                if not attached["viewer_only"] and key:
-                    try:
-                        manager.write_input(session_id, key, owner)
-                    except TerminalError:
-                        attached["viewer_only"] = True
-                        print("[terminal input lease lost; continuing viewer-only]", file=sys.stderr, flush=True)
-            time.sleep(float(attached["poll_seconds"]))
-    finally:
-        manager.detach_interactive(session_id, owner)
+    with _windows_vt_console(sys.stdin, sys.stdout):
+        attached = manager.attach_interactive(session_id)
+        owner = str(attached["owner"])
+        cursor = 0
+        offset = 0
+        size: tuple[int, int] | None = None
+        keys = _VtKeyBuffer()
+
+        def forward(chunks: tuple[str, ...]) -> None:
+            for chunk in chunks:
+                if attached["viewer_only"] or not chunk:
+                    continue
+                try:
+                    manager.write_input(session_id, chunk, owner)
+                except TerminalError:
+                    attached["viewer_only"] = True
+                    print("[terminal input lease lost; continuing viewer-only]", file=sys.stderr, flush=True)
+
+        try:
+            if attached["viewer_only"]:
+                print("Attached viewer-only: terminal input is leased by automation.", file=sys.stderr, flush=True)
+            print("Interactive attach active; press Ctrl-] to detach safely.", file=sys.stderr, flush=True)
+            while manager.status(session_id).get("state") == "running":
+                current_size = _console_size(sys.stdout)
+                if current_size != size:
+                    manager.resize(session_id, *current_size)
+                    size = current_size
+                packet = manager.read_since(session_id, cursor, offset=offset)
+                if packet.get("behind_cursor"):
+                    print("[live output cursor fell behind; replaying retained output]", file=sys.stderr, flush=True)
+                    cursor = max(0, int(packet.get("oldest_seq", 1)) - 1)
+                    offset = 0
+                    continue
+                text = str(packet.get("output", ""))
+                if text:
+                    _write_terminal_output(sys.stdout, text)
+                cursor = int(packet.get("next_seq", cursor))
+                offset = int(packet.get("next_offset", 0))
+                while msvcrt.kbhit():
+                    key = msvcrt.getwch()
+                    if key == "\x1d":
+                        return
+                    if key in {"\x00", "\xe0"}:
+                        extended = msvcrt.getwch()
+                        chunks = keys.flush(force=True) + (
+                            {"H": "\x1b[A", "P": "\x1b[B", "K": "\x1b[D", "M": "\x1b[C"}.get(extended, ""),
+                        )
+                    else:
+                        chunks = keys.feed(key)
+                    forward(chunks)
+                forward(keys.flush())
+                time.sleep(float(attached["poll_seconds"]))
+        finally:
+            manager.detach_interactive(session_id, owner)
 
 
 def main(argv: list[str] | None = None) -> int:

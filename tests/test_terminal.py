@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
+from io import BytesIO
 import os
 from dataclasses import replace
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from dual_codex.config import AgentConfig, OrchestratorConfig
+from dual_codex.cli import _VtKeyBuffer, _WindowsConsoleModes, _interactive_attach, _windows_vt_console, _write_terminal_output
 from dual_codex.paths import same_path
 from dual_codex.terminal import (
     TerminalError,
@@ -107,6 +111,8 @@ class TerminalTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for the ConPTY host regression")
     def test_pty_live_cursor_replays_utf8_record_suffix(self) -> None:
         source = (Path(__file__).parents[1] / "scripts" / "pty-host.js").read_text(encoding="utf-8")
+        self.assertIn('socket.setEncoding("utf8")', source)
+        self.assertNotIn('pending += chunk.toString("utf8")', source)
         script = f"""
 const source = {json.dumps(source)};
 const start = source.indexOf("function utf8PrefixLength");
@@ -120,6 +126,17 @@ packet = liveOutput(packet.next_seq, 2, packet.next_offset);
 if (packet.output !== "\\u00e9" || packet.next_seq !== 1 || packet.next_offset !== 3) throw new Error(JSON.stringify(packet));
 packet = liveOutput(packet.next_seq, 2, packet.next_offset);
 if (packet.output !== "B" || packet.next_seq !== 1 || packet.next_offset !== 0) throw new Error(JSON.stringify(packet));
+output = [{{seq: 1, text: "\\u001b[38;2;1;2;3m"}}, {{seq: 2, text: "ol\\u00e1"}}, {{seq: 3, text: "\\u001b[0m"}}];
+let cursor = 0;
+let offset = 0;
+let replay = "";
+for (let index = 0; index < 20 && (cursor < 3 || offset); index += 1) {{
+  packet = liveOutput(cursor, 4, offset);
+  replay += packet.output;
+  cursor = packet.next_seq;
+  offset = packet.next_offset;
+}}
+if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.stringify({{replay, cursor, offset}}));
 """
         result = subprocess.run([shutil.which("node") or "node", "-"], input=script, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -296,6 +313,148 @@ if (packet.output !== "B" || packet.next_seq !== 1 || packet.next_offset !== 0) 
         ) as request:
             manager.write_input("biel4-session", "\x1b[A", "human:viewer")
         self.assertEqual(request.call_args.args[1], {"op": "write_input", "owner": "human:viewer", "data": "\x1b[A"})
+
+    def test_resize_is_bounded_and_uses_existing_session_pipe(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        session = SimpleNamespace(pipe=r"\\.\pipe\dual-codex-biel4-session-aaaaaaaaaaaaaaaa")
+        with patch.object(manager, "_load", return_value=session), patch(
+            "dual_codex.terminal._pipe_request", return_value={"ok": True}
+        ) as request:
+            manager.resize("biel4-session", 120, 40)
+        self.assertEqual(request.call_args.args[1], {"op": "resize", "cols": 120, "rows": 40})
+        with self.assertRaisesRegex(TerminalError, "safe range"):
+            manager.resize("biel4-session", 501, 40)
+
+    def test_snapshot_attach_remains_a_read_alias(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        with patch.object(manager, "read", return_value="snapshot") as read:
+            self.assertEqual(manager.attach_snapshot("biel4-session", 42), "snapshot")
+        read.assert_called_once_with("biel4-session", 42)
+
+    def test_windows_console_modes_preserve_bits_and_restore_after_exception(self) -> None:
+        current = {10: 0x41, 11: 0x82}
+        writes: list[tuple[int, int]] = []
+
+        def set_mode(handle: int, mode: int) -> None:
+            writes.append((handle, mode))
+            current[handle] = mode
+
+        with _WindowsConsoleModes(((10, 0x0200), (11, 0x000D)), current.__getitem__, set_mode):
+            self.assertEqual(current, {10: 0x241, 11: 0x8F})
+        self.assertEqual(current, {10: 0x41, 11: 0x82})
+
+        with self.assertRaisesRegex(RuntimeError, "detach"):
+            with _WindowsConsoleModes(((10, 0x0200), (11, 0x000D)), current.__getitem__, set_mode):
+                self.assertEqual(current, {10: 0x241, 11: 0x8F})
+                raise RuntimeError("detach")
+
+        self.assertEqual(current, {10: 0x41, 11: 0x82})
+        self.assertEqual(writes[-2:], [(11, 0x82), (10, 0x41)])
+
+    def test_windows_console_modes_restore_for_ctrl_c_and_process_exit(self) -> None:
+        for failure in (KeyboardInterrupt(), SystemExit(2)):
+            with self.subTest(failure=type(failure).__name__):
+                current = {10: 3}
+
+                def set_mode(handle: int, mode: int) -> None:
+                    current[handle] = mode
+
+                with self.assertRaises(type(failure)):
+                    with _WindowsConsoleModes(((10, 0x0200),), current.__getitem__, set_mode):
+                        raise failure
+                self.assertEqual(current[10], 3)
+
+    def test_windows_console_modes_restore_partial_enable_failure(self) -> None:
+        current = {10: 1, 11: 2}
+
+        def set_mode(handle: int, mode: int) -> None:
+            if handle == 11 and mode != 2:
+                raise TerminalError("mode failure")
+            current[handle] = mode
+
+        with self.assertRaisesRegex(TerminalError, "mode failure"):
+            with _WindowsConsoleModes(((10, 0x0200), (11, 0x0004)), current.__getitem__, set_mode):
+                pass
+        self.assertEqual(current, {10: 1, 11: 2})
+
+    def test_interactive_output_writes_exact_vt_utf8_bytes_across_chunks(self) -> None:
+        stream = SimpleNamespace(buffer=BytesIO())
+        chunks = ["\x1b[?25l\x1b[38;2;1;2;3m", "olá 🎨", "\x1b[0m\x1b[?25h"]
+        for chunk in chunks:
+            _write_terminal_output(stream, chunk)
+        self.assertEqual(stream.buffer.getvalue(), "".join(chunks).encode("utf-8"))
+
+    def test_interactive_console_rejects_redirected_handles_explicitly(self) -> None:
+        redirected = SimpleNamespace(isatty=lambda: False)
+        console = SimpleNamespace(isatty=lambda: True)
+        with self.assertRaisesRegex(TerminalError, "redirection"):
+            _windows_vt_console(redirected, console)
+
+    def test_vt_key_buffer_groups_navigation_and_delays_partial_escape(self) -> None:
+        for sequence in ("\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D", "\x1b[3~", "\x1b[H", "\x1b[F", "\x1bOP"):
+            with self.subTest(sequence=repr(sequence)):
+                keys = _VtKeyBuffer()
+                emitted = tuple(chunk for key in sequence for chunk in keys.feed(key, now=0.0))
+                self.assertEqual(emitted, (sequence,))
+
+        keys = _VtKeyBuffer(timeout=0.05)
+        self.assertEqual(keys.feed("\x1b", now=1.0), ())
+        self.assertEqual(keys.flush(now=1.04), ())
+        self.assertEqual(keys.feed("[", now=1.04), ())
+        self.assertEqual(keys.flush(now=1.08), ())
+        self.assertEqual(keys.feed("A", now=1.08), ("\x1b[A",))
+
+        self.assertEqual(keys.feed("\x1b", now=2.0), ())
+        self.assertEqual(keys.flush(now=2.051), ("\x1b",))
+
+    @unittest.skipUnless(sys.platform == "win32", "Interactive attach uses msvcrt")
+    def test_ctrl_close_detaches_after_ordered_replay_and_initial_resize(self) -> None:
+        import msvcrt
+
+        manager = SimpleNamespace()
+        manager.attach_interactive = lambda _session: {
+            "owner": "human:test",
+            "viewer_only": False,
+            "poll_seconds": 0.05,
+        }
+        manager.status = lambda _session: {"state": "running"}
+        manager.read_since = lambda _session, _cursor, offset=0: {
+            "output": "\x1b[31molá\x1b[0m",
+            "next_seq": 2,
+            "next_offset": 0,
+            "behind_cursor": False,
+        }
+        manager.resize = unittest.mock.Mock()
+        manager.write_input = unittest.mock.Mock()
+        manager.detach_interactive = unittest.mock.Mock()
+        rendered: list[str] = []
+
+        with patch("dual_codex.cli._windows_vt_console", return_value=nullcontext()), patch(
+            "dual_codex.cli._console_size", return_value=(132, 43)
+        ), patch("dual_codex.cli._write_terminal_output", side_effect=lambda _stream, text: rendered.append(text)), patch.object(
+            msvcrt, "kbhit", return_value=True
+        ), patch.object(msvcrt, "getwch", side_effect=["\x1b", "[", "B", "\xe0", "H", "\x1d"]):
+            _interactive_attach(manager, "biel4-session")
+
+        self.assertEqual(rendered, ["\x1b[31molá\x1b[0m"])
+        manager.resize.assert_called_once_with("biel4-session", 132, 43)
+        self.assertEqual(
+            manager.write_input.call_args_list,
+            [
+                unittest.mock.call("biel4-session", "\x1b[B", "human:test"),
+                unittest.mock.call("biel4-session", "\x1b[A", "human:test"),
+            ],
+        )
+        manager.detach_interactive.assert_called_once_with("biel4-session", "human:test")
+
+    def test_interactive_attach_respects_existing_automation_lease(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        manager._load = unittest.mock.Mock(return_value=SimpleNamespace())
+        manager.status = unittest.mock.Mock(return_value={"state": "running"})
+        manager.acquire_input_lease = unittest.mock.Mock(side_effect=TerminalError("terminal input is busy"))
+        attached = manager.attach_interactive("biel4-session")
+        self.assertTrue(attached["viewer_only"])
+        manager.acquire_input_lease.assert_called_once()
 
     def test_session_id_is_stable_and_scoped_to_account_and_repository(self) -> None:
         same_path_a = Path(r"C:\Work Tree\target")

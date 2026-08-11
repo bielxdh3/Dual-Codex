@@ -274,8 +274,9 @@ function handle(socket, request) {
 
 const server = net.createServer((socket) => {
   let pending = "";
+  socket.setEncoding("utf8");
   socket.on("data", (chunk) => {
-    pending += chunk.toString("utf8");
+    pending += chunk;
     let newline = pending.indexOf("\n");
     while (newline >= 0) {
       const line = pending.slice(0, newline).trim();

@@ -1403,6 +1403,19 @@ class TerminalManager:
         session = self._load(session_id)
         return _pipe_request(session.pipe, {"op": "write_input", "owner": owner, "data": data})
 
+    def resize(self, session_id: str, columns: int, rows: int) -> dict[str, Any]:
+        if (
+            isinstance(columns, bool)
+            or not isinstance(columns, int)
+            or not 20 <= columns <= 500
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or not 5 <= rows <= 200
+        ):
+            raise TerminalError("Terminal size is outside the safe range.")
+        session = self._load(session_id)
+        return _pipe_request(session.pipe, {"op": "resize", "cols": columns, "rows": rows})
+
     def attach_snapshot(self, session_id: str, lines: int = 80) -> str:
         """Backward-compatible non-destructive snapshot attach."""
         return self.read(session_id, lines)
