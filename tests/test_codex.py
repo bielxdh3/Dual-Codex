@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from dual_codex.codex import run_codex_exec, run_codex_terminal
 from dual_codex.config import AgentConfig
 from dual_codex.process import CommandResult, _prepare_command
+from dual_codex.terminal import TerminalError
 
 
 def _agent(sandbox: str) -> AgentConfig:
@@ -23,6 +26,66 @@ def _agent(sandbox: str) -> AgentConfig:
 
 
 class CodexCommandTests(unittest.TestCase):
+    def test_terminal_capture_normalizes_executor_result_before_schema_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "target"
+            repository.mkdir()
+            output_path = root / "report.json"
+            session = SimpleNamespace(
+                session_id="biel4-test",
+                account="biel4",
+                role="executor",
+                repository=repository,
+                codex_home=root / "profile",
+                pid=123,
+                process_started_at=1.0,
+                pipe=r"\\.\pipe\dual-codex-biel4-test",
+            )
+            modern_result = {
+                "status": "completed",
+                "repository": str(repository),
+                "files_changed": ["README.md"],
+                "commands_run": ["pytest -q"],
+                "tests": {
+                    "command": "pytest -q",
+                    "result": "passed",
+                    "exit_code": 0,
+                    "tests_run": 1,
+                },
+                "remaining_issues": [],
+            }
+            with patch("dual_codex.terminal.TerminalManager") as manager_type:
+                manager = manager_type.return_value
+                manager._load.return_value = session
+                manager.status.return_value = {"state": "running", "alive": True}
+                manager.ensure.return_value = session
+                manager.turn_cursor.return_value = (None, 0)
+                manager.send.return_value = {"state": "turn_started"}
+                manager.wait_for_turn.return_value = {
+                    "state": "completed",
+                    "assistant": json.dumps(modern_result),
+                    "session_id": "codex-session",
+                }
+
+                result = run_codex_terminal(
+                    config=object(),
+                    agent=_agent("workspace-write"),
+                    repository=repository,
+                    prompt="implement",
+                    output_path=output_path,
+                    session_id="biel4-test",
+                    reuse_existing=True,
+                )
+
+            self.assertEqual(result.returncode, 0)
+            captured = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(captured),
+                {"summary", "files_changed", "commands_run", "tests", "remaining_issues"},
+            )
+            self.assertEqual(captured["tests"][0]["status"], "passed")
+
     def test_executor_command_explicitly_requests_workspace_write_and_target_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -114,6 +177,32 @@ class CodexCommandTests(unittest.TestCase):
             self.assertIn(str(missing), result.stderr)
             self.assertEqual(result.metadata["task_transport"], "file")
             self.assertEqual(result.metadata["task_artifact"], str(missing.resolve()))
+
+    def test_strict_reuse_refuses_to_start_a_missing_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "task.md"
+            artifact.write_text("task\n", encoding="utf-8")
+            with patch("dual_codex.terminal.TerminalManager") as manager_type:
+                manager = manager_type.return_value
+                manager._load.side_effect = TerminalError("Unknown terminal session 'test-session'.")
+                result = run_codex_terminal(
+                    config=object(),
+                    agent=_agent("workspace-write"),
+                    repository=root,
+                    prompt="Read the task artifact.",
+                    output_path=root / "report.json",
+                    session_id="test-session",
+                    task_artifact_path=artifact,
+                    task_sha256="a" * 64,
+                    reuse_existing=True,
+                )
+
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("Strict reuse requires an existing terminal session", result.stderr)
+            manager.ensure.assert_not_called()
+            manager.start.assert_not_called()
+            self.assertTrue(result.metadata["reuse_existing"])
 
 
 if __name__ == "__main__":

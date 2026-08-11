@@ -57,6 +57,9 @@ const leases = new Map();
 let implicitWriter = "";
 const state = {
   session_id: sessionId,
+  pipe: pipePath,
+  host_pid: process.pid,
+  host_started_at: Date.now() / 1000,
   pid: null,
   alive: true,
   started_at: new Date().toISOString(),

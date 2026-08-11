@@ -71,7 +71,9 @@ def run_codex_exec(**kwargs):
         kwargs["agent"].account_name,
         kwargs["repository"],
     )
-    terminal_kwargs["reuse_existing"] = bool(kwargs.get("reuse_existing", False))
+    # Native Executor delegation is always strict: never replace or fall back
+    # from the already-registered TUI when an attempt-level probe fails.
+    terminal_kwargs["reuse_existing"] = True
     return run_codex_terminal(**terminal_kwargs)
 
 

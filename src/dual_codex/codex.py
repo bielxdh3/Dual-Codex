@@ -15,7 +15,12 @@ def run_codex_app_server(**kwargs) -> CommandResult:
 
 
 def _report_from_message(message: str) -> dict | None:
-    candidates = [message.strip()]
+    from .app_server import _normalise_report
+
+    normalised = _normalise_report(message)
+    candidates = [normalised.strip()]
+    if normalised != message:
+        candidates.append(message.strip())
     if "```" in message:
         candidates.extend(
             part.strip()
@@ -97,6 +102,7 @@ def run_codex_terminal(
         "task_transport": transport,
         "task_artifact": artifact,
         "task_sha256": task_sha256,
+        "reuse_existing": reuse_existing,
     }
     if task_artifact_path is not None and not task_artifact_path.is_file():
         return CommandResult(
@@ -108,7 +114,33 @@ def run_codex_terminal(
         )
     manager = TerminalManager(config)
     try:
-        add_dirs = (task_artifact_path.parent.resolve(),) if task_artifact_path is not None else ()
+        if reuse_existing:
+            try:
+                manager._load(session_id)
+                current = manager.status(session_id)
+            except TerminalError as exc:
+                return CommandResult(
+                    ["codex", "--no-alt-screen", "--sandbox", agent.sandbox],
+                    1,
+                    "",
+                    f"Strict reuse requires an existing terminal session: {exc}",
+                    metadata,
+                )
+            if current.get("state") != "running" or current.get("alive") is False:
+                return CommandResult(
+                    ["codex", "--no-alt-screen", "--sandbox", agent.sandbox],
+                    1,
+                    "",
+                    f"Strict reuse requires a running terminal session; observed state '{current.get('state', 'unknown')}'.",
+                    metadata,
+                )
+            # The pre-opened TUI may not have been launched with the task-artifact
+            # directory. Reuse it without requesting a new add-dir or spawning a
+            # replacement; the short control message still points at the immutable
+            # artifact captured by the orchestrator.
+            add_dirs = ()
+        else:
+            add_dirs = (task_artifact_path.parent.resolve(),) if task_artifact_path is not None else ()
         session = manager.ensure(
             session_id=session_id,
             agent=agent,
@@ -149,17 +181,23 @@ def run_codex_terminal(
                 "reuse_provenance": {
                     "mode": "strict_existing" if reuse_existing else "reuse_or_start",
                     "terminal_session_id": session.session_id,
-                    "session_record": session.session_file,
+                    "session_record": getattr(session, "session_file", ""),
                     "session_host_pid": session.pid,
-                    "session_process_epoch": session.process_epoch,
-                    "session_process_start_identity": session.process_start_identity,
+                    "session_process_epoch": getattr(session, "process_epoch", ""),
+                    "session_process_start_identity": getattr(session, "process_start_identity", ""),
                     "terminal_pid": terminal_pid,
                     "host_pid": host_pid,
                     "account": session.account,
                     "role": session.role,
-                    "repository_identity": session.repository_identity or str(session.repository),
-                    "codex_home_identity": session.codex_home_identity or str(session.codex_home),
+                    "repository_identity": getattr(session, "repository_identity", "") or str(session.repository),
+                    "codex_home_identity": getattr(session, "codex_home_identity", "") or str(session.codex_home),
                     "codex_session_id": result.get("session_id", ""),
+                    "repository": str(session.repository),
+                    "codex_home": str(session.codex_home),
+                    "pid": session.pid,
+                    "host_pid": host_pid,
+                    "process_started_at": getattr(session, "process_started_at", 0.0),
+                    "pipe": getattr(session, "pipe", ""),
                 },
             },
         )

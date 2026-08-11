@@ -204,6 +204,7 @@ class DelegationTests(unittest.TestCase):
                 terminal.call_args.kwargs["session_id"],
                 session_id_for("executor", repository),
             )
+            self.assertTrue(terminal.call_args.kwargs["reuse_existing"])
 
     def test_legacy_adapter_keeps_schema_and_check_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
