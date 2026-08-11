@@ -136,7 +136,7 @@ class _AppServerProcess:
         self._event_publication_stop = threading.Event()
         self._closed = False
         command = [config.codex_command, "app-server", "--stdio"]
-        process_args, use_shell = _prepare_command([str(item) for item in command])
+        process_args = _prepare_command([str(item) for item in command])
         env = codex_environment(agent)
         self.process = subprocess.Popen(
             process_args,
@@ -149,7 +149,7 @@ class _AppServerProcess:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
-            shell=use_shell,
+            shell=False,
         )
         threading.Thread(target=self._publish_events, name="dual-codex-event-journal", daemon=True).start()
         threading.Thread(target=self._read_stdout, name="dual-codex-app-server", daemon=True).start()

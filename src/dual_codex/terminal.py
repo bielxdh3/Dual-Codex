@@ -33,70 +33,9 @@ _TURN_START_EVENTS = {"task_started", "turn_started", "turn_start"}
 _ANSI_SEQUENCE = re.compile(
     r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-_])"
 )
-_READY_PROMPT = re.compile(r"(?m)^\s*›\s*[^\r\n]*$")
 
 
 class TuiReadinessDetector:
-    """Small state machine for Codex's redraw-heavy startup screen."""
-
-    READY = "READY"
-    NOT_READY = "NOT_READY"
-    SETUP_REQUIRED = "SETUP_REQUIRED"
-    FAILED = "FAILED"
-
-    def __init__(self) -> None:
-        self.state = self.NOT_READY
-        self.seen_update = False
-        self.seen_trust = False
-        self.seen_ready = False
-        self._raw = ""
-        self.sanitized_tail = ""
-
-    @staticmethod
-    def sanitize(value: str) -> str:
-        return _ANSI_SEQUENCE.sub("", value).replace("\r", "")
-
-    def feed(self, chunk: str) -> str:
-        self._raw = (self._raw + str(chunk))[-50000:]
-        text = self.sanitize(self._raw)
-        self.sanitized_tail = text[-12000:]
-        if "Update now" in text and "Skip" in text:
-            self.seen_update = True
-
-        last_prompt = text.rfind("›")
-        last_trust = text.rfind("Do you trust the contents of this directory?")
-        last_disabled = text.rfind("Input disabled until setup completes")
-        last_loading = text.rfind("model:     loading")
-        last_model = max(text.rfind("model:"), text.rfind("model:     gpt-"))
-        last_working = text.rfind("Working (")
-
-        if last_trust > last_prompt or last_disabled > last_prompt or last_loading > last_model:
-            self.seen_trust |= last_trust >= 0
-            self.state = self.SETUP_REQUIRED if last_trust > last_prompt else self.NOT_READY
-            return self.state
-        if "Error:" in text[max(0, len(text) - 2000):] and last_prompt < last_working:
-            self.state = self.FAILED
-            return self.state
-
-        has_prompt = _READY_PROMPT.search(text) is not None
-        if has_prompt and last_prompt > last_working and last_model >= 0:
-            self.seen_ready = True
-            self.state = self.READY
-        else:
-            self.state = self.NOT_READY
-        return self.state
-
-    def diagnostics(self) -> dict[str, Any]:
-        return {
-            "state": self.state,
-            "seen_update": self.seen_update,
-            "seen_trust": self.seen_trust,
-            "seen_ready": self.seen_ready,
-            "tail": self.sanitized_tail[-4000:],
-        }
-
-
-class _HardenedTuiReadinessDetector:
     """Require a stable normal Codex screen before declaring the TUI idle."""
 
     READY = "READY"
@@ -241,9 +180,6 @@ class _HardenedTuiReadinessDetector:
             "ready_evidence": self.ready_evidence,
             "tail": self.sanitized_tail[-4000:],
         }
-
-
-TuiReadinessDetector = _HardenedTuiReadinessDetector
 
 
 class TuiTurnStartDetector:
@@ -1402,6 +1338,19 @@ class TerminalManager:
             raise TerminalError("Raw terminal input contains NUL.")
         session = self._load(session_id)
         return _pipe_request(session.pipe, {"op": "write_input", "owner": owner, "data": data})
+
+    def resize(self, session_id: str, columns: int, rows: int) -> dict[str, Any]:
+        if (
+            isinstance(columns, bool)
+            or not isinstance(columns, int)
+            or not 20 <= columns <= 500
+            or isinstance(rows, bool)
+            or not isinstance(rows, int)
+            or not 5 <= rows <= 200
+        ):
+            raise TerminalError("Terminal size is outside the safe range.")
+        session = self._load(session_id)
+        return _pipe_request(session.pipe, {"op": "resize", "cols": columns, "rows": rows})
 
     def attach_snapshot(self, session_id: str, lines: int = 80) -> str:
         """Backward-compatible non-destructive snapshot attach."""

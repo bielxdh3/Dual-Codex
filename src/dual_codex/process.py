@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 from .config import AgentConfig
 
@@ -22,22 +22,37 @@ class CommandResult:
     returncode: int
     stdout: str
     stderr: str
-    metadata: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def _prepare_command(args: list[str]) -> tuple[list[str] | str, bool]:
-    """Make npm-installed .cmd/.bat launchers executable on Windows."""
+_CMD_CONTROL_CHARACTERS = frozenset("&|<>^()%!\r\n")
+
+
+def _prepare_command(args: list[str]) -> list[str] | str:
+    """Run npm .cmd/.bat shims through a constrained command processor."""
     if os.name != "nt" or not args:
-        return args, False
+        return args
 
     resolved = shutil.which(args[0])
     if resolved:
         args = [resolved, *args[1:]]
 
     if Path(args[0]).suffix.lower() in {".cmd", ".bat"}:
-        return subprocess.list2cmdline(args), True
+        if not resolved:
+            raise ValueError("Windows command shim must resolve to an existing .cmd or .bat file")
+        unsafe = next((arg for arg in args if any(char in arg for char in _CMD_CONTROL_CHARACTERS)), None)
+        if unsafe is not None:
+            raise ValueError("Windows command shim arguments cannot contain cmd.exe control characters")
+        command_processor = os.environ.get(
+            "COMSPEC",
+            str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "cmd.exe"),
+        )
+        # .cmd/.bat files require cmd.exe; keep shell=False and expose only a
+        # validated argv string to the minimum compatibility shim.
+        command_line = subprocess.list2cmdline(args)
+        return f'{subprocess.list2cmdline([command_processor])} /d /s /v:off /c "{command_line}"'
 
-    return args, False
+    return args
 
 
 def run_command(
@@ -51,7 +66,7 @@ def run_command(
     progress_interval: float = 15.0,
 ) -> CommandResult:
     display_args = [str(part) for part in command]
-    process_args, use_shell = _prepare_command(display_args.copy())
+    process_args = _prepare_command(display_args.copy())
 
     if progress is None:
         completed = subprocess.run(
@@ -64,7 +79,7 @@ def run_command(
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            shell=use_shell,
+            shell=False,
         )
     else:
         completed = _run_with_progress(
@@ -72,7 +87,6 @@ def run_command(
             cwd=cwd,
             env=env,
             stdin=stdin,
-            shell=use_shell,
             progress=progress,
             progress_interval=progress_interval,
         )
@@ -96,7 +110,6 @@ def _run_with_progress(
     cwd: Path,
     env: dict[str, str] | None,
     stdin: str | None,
-    shell: bool,
     progress: Callable[[str], None],
     progress_interval: float,
 ) -> subprocess.CompletedProcess[str]:
@@ -110,7 +123,7 @@ def _run_with_progress(
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        shell=shell,
+        shell=False,
     )
     stop = threading.Event()
     started = time.monotonic()

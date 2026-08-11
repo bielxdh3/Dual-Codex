@@ -21,6 +21,7 @@ from dual_codex.delegation import (
     delegate,
     parse_request,
     run_codex_exec as run_delegation_codex_exec,
+    _classify_executor_result,
     _read_report,
     TASK_CONTROL_MESSAGE_MAX,
 )
@@ -105,6 +106,79 @@ def _request(repository: Path, *, action: str = "implement") -> dict:
 
 
 class DelegationTests(unittest.TestCase):
+    def test_valid_structured_report_ignores_transport_transcript_failure_markers(self) -> None:
+        report = {
+            "summary": "Implementation and tests completed.",
+            "files_changed": ["change.txt"],
+            "commands_run": [],
+            "tests": [
+                {
+                    "command": "test_structured_report_with_read_only_blocker_is_failed",
+                    "status": "passed",
+                    "details": "failure marker coverage passed; no changes required in the fixture",
+                }
+            ],
+            "remaining_issues": [],
+        }
+        transcript = "\n".join(
+            (
+                "failed failure not applied no changes required nothing to change",
+                "test_structured_report_with_read_only_blocker_is_failed",
+            )
+        )
+        for transport in ("file", "app_server"):
+            with self.subTest(transport=transport):
+                status, summary, error = _classify_executor_result(
+                    report=report,
+                    report_error="",
+                    changed=["change.txt"],
+                    command_result=CommandResult(
+                        ["codex"],
+                        0,
+                        transcript,
+                        transcript,
+                        {"task_transport": transport},
+                    ),
+                )
+                self.assertEqual((status, summary, error), ("completed", report["summary"], ""))
+
+    def test_structured_failure_signals_remain_failed(self) -> None:
+        successful_report = {
+            "summary": "Implementation completed.",
+            "files_changed": ["change.txt"],
+            "commands_run": [],
+            "tests": [{"command": "validation", "status": "passed", "details": "ok"}],
+            "remaining_issues": [],
+        }
+        cases = {
+            "summary": {**successful_report, "summary": "Implementation was not applied."},
+            "remaining_issues": {
+                **successful_report,
+                "remaining_issues": ["Permission denied by sandbox."],
+            },
+            "failed_test": {
+                **successful_report,
+                "tests": [{"command": "validation", "status": "failed", "details": "failed"}],
+            },
+            "not_run_test": {
+                **successful_report,
+                "tests": [{"command": "validation", "status": "not_run", "details": "blocked"}],
+            },
+            "unsupported_test": {
+                **successful_report,
+                "tests": [{"command": "validation", "status": "unsupported", "details": "unknown"}],
+            },
+        }
+        for name, report in cases.items():
+            with self.subTest(signal=name):
+                status, _, _ = _classify_executor_result(
+                    report=report,
+                    report_error="",
+                    changed=["change.txt"],
+                    command_result=CommandResult(["codex"], 0, "", ""),
+                )
+                self.assertEqual(status, "failed")
+
     def test_terminal_adapter_drops_legacy_schema_and_check_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -293,6 +367,48 @@ class DelegationTests(unittest.TestCase):
             self.assertEqual(outcome.status, "completed")
             self.assertEqual(result["parent_request_id"], "req-original")
             self.assertEqual(result["executor_sandbox"], "workspace-write")
+
+    def test_changed_report_allows_benign_unavailable_tool_limitation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = _make_repository(root)
+            config = _make_config(root, repository)
+            request_file = root / "request.json"
+            result_file = root / "result.json"
+            request_file.write_text(json.dumps(_request(repository)), encoding="utf-8")
+
+            def run_executor(**kwargs):
+                (repository / "change.txt").write_text("implemented\n", encoding="utf-8")
+                kwargs["output_path"].write_text(
+                    json.dumps(
+                        {
+                            "summary": "Implementation and focused tests completed.",
+                            "files_changed": ["change.txt"],
+                            "commands_run": ["python -m unittest", "npm audit"],
+                            "tests": [
+                                {"command": "python -m unittest", "status": "passed", "details": "ok"}
+                            ],
+                            "remaining_issues": [
+                                "npm audit could not be queried because the registry was temporarily unavailable."
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return CommandResult(["codex", "exec"], 0, "", "")
+
+            with patch("dual_codex.delegation.login_status", return_value="OK"), patch(
+                "dual_codex.delegation.run_codex_exec", side_effect=run_executor
+            ):
+                outcome = delegate(config, request_file=request_file, result_file=result_file)
+
+            result = json.loads(result_file.read_text(encoding="utf-8"))
+            self.assertEqual(outcome.status, "completed")
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(
+                result["remaining_issues"],
+                ["npm audit could not be queried because the registry was temporarily unavailable."],
+            )
 
     def test_structured_report_with_read_only_blocker_is_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

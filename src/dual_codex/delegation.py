@@ -798,14 +798,14 @@ def _report_list(report: Mapping[str, Any], name: str) -> list[Any]:
 
 _EXECUTOR_FAILURE_MARKERS = (
     "read-only",
-    "permission",
-    "could not",
-    "unable",
     "blocked",
     "rejected",
-    "failed to",
     "not applied",
-    "not possible",
+    "could not apply",
+    "could not be applied",
+    "unable to apply",
+    "failed to apply",
+    "permission denied by sandbox",
     "no required changes",
     "no changes required",
     "nothing to change",
@@ -838,18 +838,13 @@ def _classify_executor_result(
     summary = str(report.get("summary", "Executor completed."))
     remaining_issues = _report_list(report, "remaining_issues")
     tests = _report_list(report, "tests")
-    semantic_parts = [summary, *[str(item) for item in remaining_issues], command_result.stdout]
-    # App Server stderr is a structured runtime log and may contain harmless
-    # words such as "Failed to create shell snapshot". Its exit code already
-    # carries process failure, so do not treat diagnostics as report semantics.
-    if command_result.metadata.get("task_transport") != "app_server":
-        semantic_parts.append(command_result.stderr)
+    semantic_parts = [summary, *[str(item) for item in remaining_issues]]
     semantic_text = "\n".join(semantic_parts).casefold()
     if any(marker in semantic_text for marker in _EXECUTOR_FAILURE_MARKERS):
         return (
             "failed",
             summary,
-            "Executor report or output indicates that the requested change was not applied.",
+            "Executor report indicates that the requested change was not applied.",
         )
 
     for test in tests:
