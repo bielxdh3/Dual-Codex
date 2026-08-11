@@ -430,7 +430,7 @@ def _role_command(args, config) -> None:
         print(
             f"Swapped '{args.role_a}' and '{args.role_b}': "
             f"{previous[0] or '(unassigned)'} / {previous[1] or '(unassigned)'} -> "
-            f"{config.roles.get(args.role_b, '(unassigned)')} / {config.roles.get(args.role_a, '(unassigned)')}"
+            f"{previous[1] or '(unassigned)'} / {previous[0] or '(unassigned)'}"
         )
 
 

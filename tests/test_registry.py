@@ -62,6 +62,21 @@ class RegistryTests(unittest.TestCase):
 
                 assign_role(config, "executor", "missing")
 
+    def test_role_swap_output_keeps_requested_role_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            _write_registry(path)
+            output = StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(
+                    main(["--config", str(path), "role", "swap", "architect", "executor"]),
+                    0,
+                )
+            self.assertEqual(
+                output.getvalue().strip(),
+                "Swapped 'architect' and 'executor': primary / secondary -> secondary / primary",
+            )
+
     def test_rename_and_label_preserve_home_without_authentication(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"

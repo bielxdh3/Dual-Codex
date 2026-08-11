@@ -48,6 +48,7 @@ class CodexCommandTests(unittest.TestCase):
             self.assertEqual(command[command.index("--add-dir") + 1], str(repository))
             self.assertIn('sandbox_mode="workspace-write"', command)
             self.assertEqual(run_mock.call_args.kwargs["env"]["CODEX_HOME"], str(Path("C:/CodexProfiles/test")))
+            self.assertEqual(run_mock.call_args.kwargs["stdin"], "implement")
 
     def test_read_only_agents_do_not_receive_writable_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -75,14 +76,24 @@ class CodexCommandTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             launcher = Path(temp) / "codex.cmd"
             launcher.write_text("@echo off\n", encoding="utf-8")
-            prepared, use_shell = _prepare_command(
-                [str(launcher), "exec", "--sandbox", "workspace-write", "--add-dir", str(Path(temp) / "target")]
+            target = Path(temp) / "target with spaces"
+            prepared = _prepare_command(
+                [str(launcher), "exec", "--sandbox", "workspace-write", "--add-dir", str(target)]
             )
 
-            self.assertTrue(use_shell)
             self.assertIsInstance(prepared, str)
-            self.assertIn("--sandbox workspace-write", prepared)
-            self.assertIn("--add-dir", prepared)
+            self.assertIn("cmd.exe /d /s /v:off /c", prepared.casefold())
+            self.assertIn('"' + str(target) + '"', prepared)
+
+    @unittest.skipUnless(os.name == "nt", "Windows launcher regression")
+    def test_windows_cmd_launcher_rejects_control_metacharacters(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            launcher = Path(temp) / "codex.cmd"
+            launcher.write_text("@echo off\n", encoding="utf-8")
+            for metacharacter in ("&", "|", "<", ">", "^", "(", ")", "%", "!", "\r", "\n"):
+                with self.subTest(metacharacter=repr(metacharacter)):
+                    with self.assertRaisesRegex(ValueError, "control characters"):
+                        _prepare_command([str(launcher), "exec", f"target{metacharacter}value"])
 
     def test_file_backed_terminal_reports_missing_artifact_without_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
