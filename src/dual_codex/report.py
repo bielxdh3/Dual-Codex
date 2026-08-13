@@ -3,8 +3,41 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from uuid import uuid4
+
+
+EXECUTOR_REPORT_FIELDS = frozenset(
+    {"summary", "files_changed", "commands_run", "tests", "remaining_issues"}
+)
+EXECUTOR_REPORT_REQUIRED_WITHOUT_TELEMETRY = EXECUTOR_REPORT_FIELDS - {"commands_run"}
+
+
+def normalise_executor_report(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalise only the optional command telemetry omission.
+
+    Semantic fields and present values are deliberately left untouched so the
+    strict validator can reject malformed or incomplete reports afterwards.
+    """
+
+    normalised = dict(value)
+    if (
+        set(normalised).issubset(EXECUTOR_REPORT_FIELDS)
+        and EXECUTOR_REPORT_REQUIRED_WITHOUT_TELEMETRY.issubset(normalised)
+        and "commands_run" not in normalised
+    ):
+        normalised["commands_run"] = []
+    return normalised
+
+
+def is_executor_report_shape(value: Mapping[str, Any]) -> bool:
+    """Return whether a value is a canonical report after safe normalisation."""
+
+    keys = set(value)
+    return (
+        keys.issubset(EXECUTOR_REPORT_FIELDS)
+        and EXECUTOR_REPORT_FIELDS.issubset(keys)
+    )
 
 
 def load_json(path: Path) -> dict[str, Any]:

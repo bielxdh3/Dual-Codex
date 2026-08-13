@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import sys
 import time
+from uuid import uuid4
 
 from .config import AgentConfig, ConfigError, SUPPORTED_ROLES, load_config
 from .delegation import delegate
@@ -207,6 +208,7 @@ def _parser() -> argparse.ArgumentParser:
     terminal_start.add_argument("--role", choices=SUPPORTED_ROLES, default="executor")
     terminal_start.add_argument("--approval-policy", choices=("on-request", "never"), default="on-request")
     terminal_start.add_argument("--attach", action="store_true")
+    terminal_start.add_argument("--headless", action="store_true", help="Do not open a visible Executor viewer")
     terminal_send = terminal_sub.add_parser("send", help="Send a follow-up message to a session")
     terminal_send.add_argument("session_id")
     terminal_send.add_argument("message")
@@ -214,6 +216,7 @@ def _parser() -> argparse.ArgumentParser:
     terminal_attach.add_argument("session_id")
     terminal_attach.add_argument("--lines", type=int, default=80)
     terminal_attach.add_argument("--interactive", action="store_true", help="Attach to the live ConPTY with raw key forwarding")
+    terminal_attach.add_argument("--viewer-epoch", default="", help=argparse.SUPPRESS)
     terminal_terminate = terminal_sub.add_parser("terminate", help="Stop a session")
     terminal_terminate.add_argument("session_id")
 
@@ -450,7 +453,7 @@ def _account_agent(config, account_name: str, role: str) -> AgentConfig:
     )
 
 
-def _interactive_attach(manager: TerminalManager, session_id: str) -> None:
+def _interactive_attach(manager: TerminalManager, session_id: str, viewer_epoch: str = "") -> None:
     if sys.platform != "win32":
         raise TerminalError("Interactive ConPTY attach requires Windows.")
     import msvcrt
@@ -462,22 +465,65 @@ def _interactive_attach(manager: TerminalManager, session_id: str) -> None:
         offset = 0
         size: tuple[int, int] | None = None
         keys = _VtKeyBuffer()
+        generation = attached.get("generation")
+        human_turn_seen = False
+        viewer_registered = False
+        viewer_epoch = viewer_epoch or uuid4().hex
+        register_viewer = getattr(manager, "register_viewer", None)
+        unregister_viewer = getattr(manager, "unregister_viewer", None)
+        if callable(register_viewer):
+            try:
+                register_viewer(session_id, owner, viewer_epoch=viewer_epoch, viewer_pid=os.getpid())
+                viewer_registered = True
+            except BaseException:
+                manager.detach_interactive(session_id, owner, generation=generation)
+                raise
 
         def forward(chunks: tuple[str, ...]) -> None:
+            nonlocal generation
             for chunk in chunks:
-                if attached["viewer_only"] or not chunk:
+                if not chunk:
                     continue
                 try:
-                    manager.write_input(session_id, chunk, owner)
+                    result = manager.write_input(
+                        session_id,
+                        chunk,
+                        owner,
+                        generation=generation,
+                        auto_lease=True,
+                    )
+                    if isinstance(result, dict) and isinstance(result.get("generation"), int):
+                        if generation != result["generation"]:
+                            human_turn_seen = False
+                        generation = result["generation"]
+                    attached["viewer_only"] = False
                 except TerminalError:
                     attached["viewer_only"] = True
-                    print("[terminal input lease lost; continuing viewer-only]", file=sys.stderr, flush=True)
+                    if not attached.get("lease_warning_shown"):
+                        attached["lease_warning_shown"] = True
+                        print("[terminal input lease unavailable; continuing viewer-only]", file=sys.stderr, flush=True)
 
         try:
             if attached["viewer_only"]:
                 print("Attached viewer-only: terminal input is leased by automation.", file=sys.stderr, flush=True)
             print("Interactive attach active; press Ctrl-] to detach safely.", file=sys.stderr, flush=True)
             while manager.status(session_id).get("state") == "running":
+                status_payload = manager.status(session_id)
+                lease = status_payload.get("input_lease")
+                if isinstance(lease, dict) and lease.get("owner") == owner and lease.get("reason") == "human_command_submitted":
+                    session = manager._load(session_id)
+                    if manager._codex_turn_activity(session).get("active"):
+                        human_turn_seen = True
+                    elif human_turn_seen and manager.release_completed_human_command(
+                        session_id,
+                        owner,
+                        generation=generation,
+                        turn_seen=True,
+                    ):
+                        generation = None
+                        human_turn_seen = False
+                elif not isinstance(lease, dict) or lease.get("owner") != owner:
+                    human_turn_seen = False
                 current_size = _console_size(sys.stdout)
                 if current_size != size:
                     manager.resize(session_id, *current_size)
@@ -508,7 +554,12 @@ def _interactive_attach(manager: TerminalManager, session_id: str) -> None:
                 forward(keys.flush())
                 time.sleep(float(attached["poll_seconds"]))
         finally:
-            manager.detach_interactive(session_id, owner)
+            if generation is None:
+                manager.detach_interactive(session_id, owner)
+            else:
+                manager.detach_interactive(session_id, owner, generation=generation)
+            if viewer_registered and callable(unregister_viewer):
+                unregister_viewer(session_id, owner, viewer_epoch=viewer_epoch)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -578,21 +629,26 @@ def main(argv: list[str] | None = None) -> int:
                     role=args.role,
                     repository=repository,
                     approval_policy=args.approval_policy,
+                    visible=args.role == "executor" and not args.headless,
                 )
                 print(json.dumps(session.as_dict(), ensure_ascii=False))
                 if args.attach:
-                    while manager.status(session.session_id).get("state") == "running":
-                        text = manager.read(session.session_id)
-                        if text:
-                            print(text, end="", flush=True)
-                        time.sleep(0.5)
+                    if args.role == "executor" and not args.headless:
+                        while manager.status(session.session_id).get("state") == "running":
+                            time.sleep(0.5)
+                    else:
+                        while manager.status(session.session_id).get("state") == "running":
+                            text = manager.read(session.session_id)
+                            if text:
+                                print(text, end="", flush=True)
+                            time.sleep(0.5)
                 return 0
             if args.terminal_command == "send":
                 manager.send(args.session_id, args.message)
                 return 0
             if args.terminal_command == "attach":
                 if args.interactive:
-                    _interactive_attach(manager, args.session_id)
+                    _interactive_attach(manager, args.session_id, args.viewer_epoch)
                     return 0
                 print(manager.read(args.session_id, args.lines), end="")
                 return 0

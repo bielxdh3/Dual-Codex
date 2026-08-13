@@ -331,6 +331,11 @@ dual-codex terminal start architect-account --role architect --attach
 dual-codex terminal start executor-account --role executor --attach
 ```
 
+Ao iniciar o `executor` sem `--headless`, Dual Codex abre automaticamente uma
+janela de console para `terminal attach --interactive`; esse processo e apenas
+um viewer do ConPTY ja gerenciado e nunca inicia outro Codex. Use `--headless`
+somente para fluxos que nao exigem uma TUI humana visivel.
+
 Use `dual-codex terminal list`, `send`, `attach` e `terminate` para consultar,
 enviar follow-ups, rever a saida e encerrar sessoes. O fluxo `delegate` reutiliza
 a sessao persistente do executor para manter o contexto entre mensagens. O
@@ -372,12 +377,21 @@ ConPTY e o registro; durante uma delegacao o lease de entrada da automacao torna
 anexos humanos watch-only. O attach sem `--interactive` continua sendo o
 snapshot legado.
 
+O lease humano distingue composicao real, comandos submetidos e configuracao.
+Composicao e turnos humanos continuam exclusivos; apos inatividade comprovada o
+lease pode expirar e ser readquirido atomicamente. Comandos `/model` e
+`/reasoning` liberam o lease quando o prompt ocioso retorna, com TTL curto apenas
+como fallback de crash. O snapshot expõe geracao, atividade, expiracao e motivo
+sanitizados para diagnostico.
+
 `delegate --reuse-existing` reutiliza somente uma sessao Windows Dual Codex
 registrada, viva, pronta e livre do role `executor`, com a mesma conta,
 `CODEX_HOME` e identidade do repositorio. Ausencia, stale, busy, PID/epoch
-incompativel ou pipe inalcançavel falham fechado, sem iniciar outro TUI e sem
-alterar model/reasoning escolhidos manualmente. TUIs abertas arbitrariamente
-fora do Dual Codex nao podem ser adotadas.
+incompativel, viewer ausente ou pipe inalcançavel falham fechado, sem iniciar
+outro Codex ou alterar model/reasoning escolhidos manualmente. O registro inclui
+host PID, processo Executor, viewer PID, epoch, named pipe e identidades de
+conta/repositorio. TUIs abertas arbitrariamente fora do Dual Codex nao podem ser
+adotadas.
 
 Consulte [docs/CLI.md](docs/CLI.md), [docs/APP-INTEGRATION.md](docs/APP-INTEGRATION.md)
 e [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) para os schemas, o fluxo

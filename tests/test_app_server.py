@@ -18,6 +18,7 @@ from dual_codex.app_server import (
     app_server_call,
     run_codex_app_server,
 )
+from dual_codex.codex import _report_from_message
 from dual_codex.config import AgentConfig, OrchestratorConfig
 from dual_codex.live_events import read_journal
 
@@ -363,10 +364,12 @@ class AppServerTests(unittest.TestCase):
             _normalise_report(
                 json.dumps(
                     {
+                        "summary": "Executor completed.",
                         "request_id": "x",
                         "status": "completed",
                         "files_changed": ["src/tiny_math/core.py"],
                         "tests": {"command": "python -m unittest", "result": "passed", "exit_code": 0, "tests_run": 4},
+                        "remaining_issues": [],
                         "commit_created": False,
                     }
                 )
@@ -374,6 +377,35 @@ class AppServerTests(unittest.TestCase):
         )
         self.assertEqual(set(value), {"summary", "files_changed", "commands_run", "tests", "remaining_issues"})
         self.assertEqual(value["tests"][0]["status"], "passed")
+
+    def test_report_normalisation_defaults_only_missing_command_telemetry(self) -> None:
+        payload = {
+            "summary": "Read-only probe completed.",
+            "files_changed": [],
+            "tests": [],
+            "remaining_issues": [],
+        }
+        app_server = json.loads(_normalise_report(json.dumps(payload)))
+        native_tui = _report_from_message(json.dumps(payload))
+        self.assertEqual(app_server["commands_run"], [])
+        self.assertEqual(native_tui, app_server)
+
+    def test_report_normalisation_does_not_repair_invalid_or_missing_semantics(self) -> None:
+        invalid_commands = {
+            "summary": "done",
+            "files_changed": [],
+            "commands_run": "none",
+            "tests": [],
+            "remaining_issues": [],
+        }
+        missing_summary = {
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "remaining_issues": [],
+        }
+        self.assertEqual(json.loads(_normalise_report(json.dumps(invalid_commands))), invalid_commands)
+        self.assertEqual(json.loads(_normalise_report(json.dumps(missing_summary))), missing_summary)
 
     def test_app_server_stderr_is_sanitized_before_result_return(self) -> None:
         raw = 'auth=C:/Users/USER/.codex/auth.json token="secret-value"'

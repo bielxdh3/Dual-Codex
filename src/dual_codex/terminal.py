@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -30,6 +31,7 @@ TERMINAL_INPUT_MAX_BYTES = 8192
 TERMINAL_LIVE_READ_MAX_BYTES = 65536
 TERMINAL_SUBMIT_DELAY_SECONDS = 0.1
 TERMINAL_COMPOSER_ACK_TIMEOUT_SECONDS = 5.0
+TERMINAL_TERM = "xterm-256color"
 _COMPLETED_EVENTS = {"turn_completed", "turn_complete", "task_completed", "task_complete"}
 _ABORTED_EVENTS = {"turn_aborted", "task_aborted"}
 _TURN_START_EVENTS = {"task_started", "turn_started", "turn_start"}
@@ -55,6 +57,7 @@ class TuiReadinessDetector:
         r"(?P<directory>(?:~|[A-Za-z]:)[\\/](?:[^\r\n\u2502]*[^\s\r\n\u2502])?)"
         r"\s*(?:\u2502)?\s*$"
     )
+    _REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
     _COSMETIC = frozenset(
         {
             "Explain this codebase",
@@ -86,6 +89,8 @@ class TuiReadinessDetector:
         self.seen_placeholder = False
         self.stable_samples = 0
         self.ready_evidence = ""
+        self.target_model = ""
+        self.target_reasoning = ""
         self._fingerprint: tuple[str, str, str] | None = None
         self._raw = ""
         self.sanitized_tail = ""
@@ -93,6 +98,13 @@ class TuiReadinessDetector:
     @staticmethod
     def sanitize(value: str) -> str:
         return _ANSI_SEQUENCE.sub("", value).replace("\r", "")
+
+    @classmethod
+    def _split_model_reasoning(cls, value: str) -> tuple[str, str]:
+        parts = str(value).strip().split()
+        if parts and parts[-1].casefold() in cls._REASONING_EFFORTS and len(parts) > 1:
+            return " ".join(parts[:-1]), parts[-1]
+        return " ".join(parts), ""
 
     def feed(self, chunk: str) -> str:
         self._raw = (self._raw + str(chunk))[-50000:]
@@ -121,6 +133,10 @@ class TuiReadinessDetector:
             model_match = directory_match = footer_match
             last_model = footer_match.start("model")
             last_directory = footer_match.start("directory")
+        if model_match is not None:
+            self.target_model, self.target_reasoning = self._split_model_reasoning(
+                model_match.group("model")
+            )
         last_working = text.rfind("Working (")
         last_error = text.rfind("Error:")
 
@@ -192,6 +208,10 @@ class TuiReadinessDetector:
             "seen_placeholder": self.seen_placeholder,
             "stable_samples": self.stable_samples,
             "ready_evidence": self.ready_evidence,
+            "target_model": self.target_model or "unknown",
+            "target_reasoning": self.target_reasoning or "unknown",
+            "model_provenance": "tui_readiness" if self.target_model else "unavailable",
+            "reasoning_provenance": "tui_readiness" if self.target_reasoning else "unavailable",
             "tail": self.sanitized_tail[-4000:],
         }
 
@@ -415,6 +435,11 @@ class TerminalSession:
     baseline_rollout_mtimes: dict[str, float] = field(default_factory=dict)
     codex_session_id: str = ""
     task_artifact_dir: Path | None = None
+    viewer_pid: int = 0
+    viewer_started_at: float = 0.0
+    viewer_process_start_identity: str = ""
+    viewer_epoch: str = ""
+    visible_required: bool = False
 
     @classmethod
     def from_record(cls, raw: dict[str, Any]) -> "TerminalSession":
@@ -443,6 +468,11 @@ class TerminalSession:
             },
             codex_session_id=str(raw.get("codex_session_id", "")),
             task_artifact_dir=(Path(raw["task_artifact_dir"]) if raw.get("task_artifact_dir") else None),
+            viewer_pid=int(raw.get("viewer_pid", 0) or 0),
+            viewer_started_at=float(raw.get("viewer_started_at", 0.0) or 0.0),
+            viewer_process_start_identity=str(raw.get("viewer_process_start_identity", "")),
+            viewer_epoch=str(raw.get("viewer_epoch", "")),
+            visible_required=bool(raw.get("visible_required", False)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -469,6 +499,11 @@ class TerminalSession:
             "baseline_rollout_mtimes": self.baseline_rollout_mtimes,
             "codex_session_id": self.codex_session_id,
             "task_artifact_dir": str(self.task_artifact_dir) if self.task_artifact_dir else "",
+            "viewer_pid": self.viewer_pid,
+            "viewer_started_at": self.viewer_started_at,
+            "viewer_process_start_identity": self.viewer_process_start_identity,
+            "viewer_epoch": self.viewer_epoch,
+            "visible_required": self.visible_required,
         }
 
 
@@ -524,7 +559,9 @@ def _helper_path(config: OrchestratorConfig) -> Path:
 
 def _terminal_environment(agent: AgentConfig) -> dict[str, str]:
     """Use the account profile, never an API key inherited from the orchestrator."""
-    return codex_environment(agent)
+    environment = codex_environment(agent)
+    environment["TERM"] = TERMINAL_TERM
+    return environment
 
 
 def _pipe_request(pipe: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -680,6 +717,7 @@ class TerminalManager:
             raise TerminalError("The native ConPTY backend requires Windows.")
         self.config = config
         self._input_leases: dict[str, threading.Lock] = {}
+        self._last_readiness_diagnostics: dict[str, Any] = {}
 
     def _input_lease_lock(self, session_id: str) -> threading.Lock:
         # The lease is attempt-owned and intentionally not persisted in the
@@ -753,6 +791,68 @@ class TerminalManager:
             return {**session.as_dict(), **state, "identity_match": identity_match, "state": lifecycle}
         except (TerminalError, AttributeError, TypeError, ValueError):
             return {**session.as_dict(), "state": "unreachable"}
+
+    @staticmethod
+    def _visible_viewer_match(session: TerminalSession, status: dict[str, Any]) -> bool:
+        viewer = status.get("viewer")
+        if not isinstance(viewer, dict) or viewer.get("attached") is not True:
+            return False
+        try:
+            viewer_pid = int(viewer.get("pid") or 0)
+        except (TypeError, ValueError):
+            return False
+        if viewer_pid <= 0:
+            return False
+        expected_pid = int(getattr(session, "viewer_pid", 0) or 0)
+        if expected_pid and viewer_pid != expected_pid:
+            return False
+        expected_epoch = str(getattr(session, "viewer_epoch", "") or "")
+        if expected_epoch and str(viewer.get("viewer_epoch", "")) != expected_epoch:
+            return False
+        expected_identity = str(getattr(session, "viewer_process_start_identity", "") or "")
+        observed_identity = str(viewer.get("process_start_identity", "") or "")
+        if expected_identity and observed_identity != expected_identity:
+            return False
+        if observed_identity and os.name == "nt" and _process_start_identity(viewer_pid) != observed_identity:
+            return False
+        return True
+
+    def register_viewer(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        viewer_epoch: str,
+        viewer_pid: int | None = None,
+    ) -> dict[str, Any]:
+        owner = validate_lease_owner(owner)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,96}", str(viewer_epoch)):
+            raise TerminalError("Invalid terminal viewer epoch.")
+        pid = int(viewer_pid if viewer_pid is not None else os.getpid())
+        if pid < 1:
+            raise TerminalError("Invalid terminal viewer process.")
+        session = self._load(session_id)
+        return _pipe_request(
+            session.pipe,
+            {
+                "op": "register_viewer",
+                "owner": owner,
+                "viewer_pid": pid,
+                "viewer_epoch": str(viewer_epoch),
+                "process_start_identity": _process_start_identity(pid),
+            },
+        )
+
+    def unregister_viewer(self, session_id: str, owner: str, *, viewer_epoch: str = "") -> None:
+        owner = validate_lease_owner(owner)
+        session = self._load(session_id)
+        payload: dict[str, Any] = {"op": "unregister_viewer", "owner": owner}
+        if viewer_epoch:
+            payload["viewer_epoch"] = str(viewer_epoch)
+        try:
+            _pipe_request(session.pipe, payload)
+        except TerminalError:
+            pass
 
     def _terminal_health(self, session: TerminalSession) -> str:
         """Return only strong health evidence; transient pipe errors stay unknown."""
@@ -917,6 +1017,7 @@ class TerminalManager:
         *,
         timeout: float | None = None,
         lifecycle: TerminalLifecyclePolicy = TerminalLifecyclePolicy.PERSISTENT_REUSE,
+        require_visible: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(lifecycle, TerminalLifecyclePolicy):
             lifecycle = TerminalLifecyclePolicy(str(lifecycle))
@@ -945,8 +1046,16 @@ class TerminalManager:
                 if rollout_activity["active"]:
                     time.sleep(0.25)
                     continue
+                if require_visible and not self._visible_viewer_match(session, self.status(session_id)):
+                    diagnostics = detector.diagnostics()
+                    diagnostics["visible_executor"] = "viewer_not_attached"
+                    time.sleep(0.25)
+                    continue
                 diagnostics = detector.diagnostics()
                 diagnostics["rollout_activity"] = rollout_activity
+                self._last_readiness_diagnostics = dict(diagnostics)
+                if require_visible:
+                    diagnostics["visible_executor"] = "viewer_attached_to_canonical_session"
                 return diagnostics
             if state == TuiReadinessDetector.SETUP_REQUIRED:
                 diagnostics = detector.diagnostics()
@@ -974,6 +1083,8 @@ class TerminalManager:
         diagnostics["terminal_session_id"] = str(getattr(session, "session_id", session_id))
         diagnostics["terminal_pid"] = getattr(session, "pid", None)
         diagnostics["terminal_started_at"] = str(getattr(session, "started_at", ""))
+        if require_visible:
+            diagnostics["visible_executor"] = "viewer_not_attached"
         self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
         self._write_readiness_diagnostics(session, diagnostics)
         raise TerminalError(
@@ -1158,6 +1269,113 @@ class TerminalManager:
         except TerminalError:
             pass
 
+    def _launch_visible_viewer(self, session: TerminalSession, viewer_epoch: str | None = None) -> TerminalSession:
+        """Open a console frontend for the existing managed PTY; never start Codex here."""
+        if os.name != "nt":
+            raise TerminalError("Visible Executor attach requires Windows.")
+        epoch = str(viewer_epoch or uuid4().hex)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,96}", epoch):
+            raise TerminalError("Invalid terminal viewer epoch.")
+        attach_args = [
+            str(sys.executable),
+            "-m",
+            "dual_codex.cli",
+            "--config",
+            str(self.config.config_path.resolve()),
+            "terminal",
+            "attach",
+            session.session_id,
+            "--interactive",
+            "--viewer-epoch",
+            epoch,
+        ]
+        powershell = None
+        for name in ("powershell.exe", "pwsh.exe", "powershell", "pwsh"):
+            powershell = shutil.which(name)
+            if powershell:
+                break
+        if powershell:
+            def powershell_literal(value: str) -> str:
+                return "'" + value.replace("'", "''") + "'"
+
+            command = [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "& " + " ".join(powershell_literal(item) for item in attach_args),
+            ]
+        else:
+            command = [
+                os.environ.get("ComSpec") or shutil.which("cmd.exe") or r"C:\Windows\System32\cmd.exe",
+                "/d",
+                "/s",
+                "/c",
+                subprocess.list2cmdline(attach_args),
+            ]
+        env = os.environ.copy()
+        for secret_name in ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"):
+            env.pop(secret_name, None)
+        source_root = self.config.project_root / "src"
+        if source_root.is_dir():
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = os.pathsep.join(
+                item for item in (str(source_root), existing_pythonpath) if item
+            )
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        try:
+            viewer = subprocess.Popen(
+                command,
+                cwd=self.config.project_root,
+                env=env,
+                creationflags=flags,
+                close_fds=False,
+            )
+        except OSError as exc:
+            raise TerminalError(f"Could not open the visible Executor viewer: {exc}") from exc
+        updated = replace(
+            session,
+            viewer_pid=int(viewer.pid),
+            viewer_started_at=time.time(),
+            viewer_process_start_identity=_process_start_identity(int(viewer.pid)),
+            viewer_epoch=epoch,
+            visible_required=True,
+        )
+        for _ in range(40):
+            try:
+                status = self.status(session.session_id)
+            except TerminalError:
+                break
+            registered = status.get("viewer")
+            if isinstance(registered, dict) and registered.get("attached") is True:
+                if str(registered.get("viewer_epoch", "")) == epoch:
+                    try:
+                        registered_pid = int(registered.get("pid") or 0)
+                    except (TypeError, ValueError):
+                        registered_pid = 0
+                    if registered_pid > 0:
+                        updated = replace(
+                            updated,
+                            viewer_pid=registered_pid,
+                            viewer_process_start_identity=str(registered.get("process_start_identity", "") or ""),
+                        )
+                    break
+            poll = getattr(viewer, "poll", None)
+            if callable(poll) and poll() is not None:
+                break
+            time.sleep(0.05)
+        try:
+            atomic_write_json(_record_path(self.config, session.session_id), updated.as_dict())
+        except OSError:
+            pass
+        return updated
+
+    def _ensure_visible_viewer(self, session: TerminalSession) -> TerminalSession:
+        status = self.status(session.session_id)
+        if self._visible_viewer_match(session, status):
+            return session
+        return self._launch_visible_viewer(session)
+
     def start(
         self,
         *,
@@ -1167,6 +1385,7 @@ class TerminalManager:
         repository: Path,
         approval_policy: str = "on-request",
         add_dirs: tuple[Path, ...] = (),
+        visible: bool = False,
     ) -> TerminalSession:
         if agent.backend != "windows":
             raise TerminalError(f"Backend '{agent.backend}' is not implemented by the native terminal host.")
@@ -1245,10 +1464,17 @@ class TerminalManager:
             codex_home_identity=path_identity_key(agent.codex_home),
             baseline_rollout_mtimes=baseline_rollout_mtimes,
             task_artifact_dir=task_artifact_dir,
+            visible_required=bool(visible),
         )
         atomic_write_json(record_path, session.as_dict())
+        if visible:
+            session = self._launch_visible_viewer(session)
         try:
-            self.wait_until_ready(session_id, lifecycle=TerminalLifecyclePolicy.STARTUP)
+            self.wait_until_ready(
+                session_id,
+                lifecycle=TerminalLifecyclePolicy.STARTUP,
+                require_visible=bool(visible),
+            )
         except TerminalError:
             # Startup owns the newly spawned host. Preserve the explicit
             # cleanup boundary even when the readiness probe itself failed.
@@ -1268,6 +1494,7 @@ class TerminalManager:
 
     def ensure(self, **kwargs: Any) -> TerminalSession:
         reuse_existing = bool(kwargs.pop("reuse_existing", False))
+        visible = bool(kwargs.pop("visible", False))
         if reuse_existing:
             return self.reuse_existing(**kwargs)
         session_id = str(kwargs["session_id"])
@@ -1280,14 +1507,18 @@ class TerminalManager:
                     raise TerminalError(
                         f"Existing terminal session '{session_id}' was not started with the required task transport directory."
                     )
+                session = self._load(session_id)
+                if visible:
+                    session = self._ensure_visible_viewer(session)
                 self.wait_until_ready(
                     session_id,
                     lifecycle=TerminalLifecyclePolicy.PERSISTENT_REUSE,
+                    require_visible=visible,
                 )
                 return self._load(session_id)
             if current.get("state") in {"exited", "identity_invalid"}:
                 self._remove_record(session_id)
-        return self.start(**kwargs)
+        return self.start(visible=visible, **kwargs)
 
     def reuse_existing(
         self,
@@ -1344,10 +1575,14 @@ class TerminalManager:
             raise TerminalError("Strict reuse-existing refused: terminal host PID mismatch.")
         if not session.process_epoch or status.get("process_epoch") != session.process_epoch:
             raise TerminalError("Strict reuse-existing refused: terminal process epoch mismatch.")
+        if not self._visible_viewer_match(session, status):
+            raise TerminalError(
+                "Strict reuse-existing refused: visible interactive Executor viewer is not attached to the canonical session."
+            )
         lease = status.get("input_lease")
         if isinstance(lease, dict) and lease.get("active"):
             raise TerminalError("Strict reuse-existing refused: terminal input is busy.")
-        self.wait_until_ready(session_id)
+        self.wait_until_ready(session_id, require_visible=True)
         activity = self._codex_turn_activity(session)
         if activity.get("active"):
             raise TerminalError("Strict reuse-existing refused: terminal session is busy with a Codex turn.")
@@ -1467,6 +1702,7 @@ class TerminalManager:
         *,
         mode: str = "automation",
         ttl_seconds: float = 900.0,
+        owner_pid: int | None = None,
     ) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         if mode not in {"automation", "human"}:
@@ -1475,23 +1711,43 @@ class TerminalManager:
         if ttl <= 0 or ttl > 3600:
             raise TerminalError("Terminal input lease TTL is outside the safe range.")
         session = self._load(session_id)
-        return _pipe_request(
-            session.pipe,
-            {"op": "acquire_input_lease", "owner": owner, "mode": mode, "ttl_ms": int(ttl * 1000)},
-        )
+        request: dict[str, Any] = {
+            "op": "acquire_input_lease",
+            "owner": owner,
+            "mode": mode,
+            "ttl_ms": int(ttl * 1000),
+        }
+        if owner_pid is not None:
+            if isinstance(owner_pid, bool) or not isinstance(owner_pid, int) or owner_pid < 1:
+                raise TerminalError("Terminal input lease owner process is invalid.")
+            request["owner_pid"] = owner_pid
+        return _pipe_request(session.pipe, request)
 
-    def renew_input_lease(self, session_id: str, owner: str, *, ttl_seconds: float = 900.0) -> dict[str, Any]:
+    def renew_input_lease(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        ttl_seconds: float = 900.0,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         ttl = float(ttl_seconds)
         if ttl <= 0 or ttl > 3600:
             raise TerminalError("Terminal input lease TTL is outside the safe range.")
         session = self._load(session_id)
-        return _pipe_request(session.pipe, {"op": "renew_input_lease", "owner": owner, "ttl_ms": int(ttl * 1000)})
+        request: dict[str, Any] = {"op": "renew_input_lease", "owner": owner, "ttl_ms": int(ttl * 1000)}
+        if generation is not None:
+            request["generation"] = generation
+        return _pipe_request(session.pipe, request)
 
-    def release_input_lease(self, session_id: str, owner: str) -> dict[str, Any]:
+    def release_input_lease(self, session_id: str, owner: str, *, generation: int | None = None) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         session = self._load(session_id)
-        return _pipe_request(session.pipe, {"op": "release_input_lease", "owner": owner})
+        request: dict[str, Any] = {"op": "release_input_lease", "owner": owner}
+        if generation is not None:
+            request["generation"] = generation
+        return _pipe_request(session.pipe, request)
 
     def begin_automation_turn(self, session_id: str, owner: str = "") -> str:
         owner = validate_lease_owner(owner or f"automation:{uuid4().hex[:16]}")
@@ -1527,14 +1783,27 @@ class TerminalManager:
     def live_cursor(self, session_id: str) -> int:
         return int(self.read_since(session_id, 0, max_bytes=1).get("next_seq", 0))
 
-    def write_input(self, session_id: str, data: str, owner: str) -> dict[str, Any]:
+    def write_input(
+        self,
+        session_id: str,
+        data: str,
+        owner: str,
+        *,
+        generation: int | None = None,
+        auto_lease: bool = False,
+    ) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         if not isinstance(data, str) or not data or len(data.encode("utf-8")) > TERMINAL_INPUT_MAX_BYTES:
             raise TerminalError("Raw terminal input is empty or exceeds the safe limit.")
         if "\x00" in data:
             raise TerminalError("Raw terminal input contains NUL.")
         session = self._load(session_id)
-        return _pipe_request(session.pipe, {"op": "write_input", "owner": owner, "data": data})
+        request: dict[str, Any] = {"op": "write_input", "owner": owner, "data": data}
+        if generation is not None:
+            request["generation"] = generation
+        if auto_lease:
+            request.update({"auto_lease": True, "mode": "human", "owner_pid": os.getpid()})
+        return _pipe_request(session.pipe, request)
 
     def resize(self, session_id: str, columns: int, rows: int) -> dict[str, Any]:
         if (
@@ -1560,9 +1829,18 @@ class TerminalManager:
         if status.get("state") != "running":
             raise TerminalError(f"Cannot attach to terminal session in state {status.get('state')}.")
         owner = validate_lease_owner(f"human:{uuid4().hex[:16]}")
+        generation: int | None = None
         viewer_only = False
         try:
-            self.acquire_input_lease(session_id, owner, mode="human", ttl_seconds=3600)
+            result = self.acquire_input_lease(
+                session_id,
+                owner,
+                mode="human",
+                ttl_seconds=3600,
+                owner_pid=os.getpid(),
+            )
+            lease = result.get("input_lease") if isinstance(result, dict) else None
+            generation = lease.get("generation") if isinstance(lease, dict) else None
         except TerminalError as exc:
             if "busy" not in str(exc).casefold() and "lease" not in str(exc).casefold():
                 raise
@@ -1570,15 +1848,43 @@ class TerminalManager:
         return {
             "session": session,
             "owner": owner,
+            "generation": generation if isinstance(generation, int) else None,
             "viewer_only": viewer_only,
             "poll_seconds": max(0.02, min(float(poll_seconds), 1.0)),
         }
 
-    def detach_interactive(self, session_id: str, owner: str) -> None:
+    def detach_interactive(self, session_id: str, owner: str, *, generation: int | None = None) -> None:
         try:
-            self.release_input_lease(session_id, owner)
+            self.release_input_lease(session_id, owner, generation=generation)
         except TerminalError:
             pass
+
+    def release_completed_human_command(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        generation: int | None = None,
+        turn_seen: bool = False,
+    ) -> bool:
+        """Release a human lease only after its submitted Codex turn completed."""
+        if not turn_seen:
+            return False
+        status = self.status(session_id)
+        lease = status.get("input_lease")
+        if not isinstance(lease, dict) or not lease.get("active"):
+            return False
+        if lease.get("owner") != owner or lease.get("mode") != "human":
+            return False
+        if lease.get("composition_active") or lease.get("configuration_pending"):
+            return False
+        if lease.get("reason") != "human_command_submitted":
+            return False
+        session = self._load(session_id)
+        if self._codex_turn_activity(session).get("active"):
+            return False
+        self.release_input_lease(session_id, owner, generation=generation)
+        return True
 
     def turn_cursor(self, session_id: str) -> tuple[Path | None, int]:
         session = self._load(session_id)

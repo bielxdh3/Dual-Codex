@@ -43,6 +43,7 @@ class CodexCommandTests(unittest.TestCase):
                 pipe=r"\\.\pipe\dual-codex-biel4-test",
             )
             modern_result = {
+                "summary": "Executor completed.",
                 "status": "completed",
                 "repository": str(repository),
                 "files_changed": ["README.md"],
@@ -79,12 +80,80 @@ class CodexCommandTests(unittest.TestCase):
                 )
 
             self.assertEqual(result.returncode, 0)
+            self.assertNotIn("visible", manager.ensure.call_args.kwargs)
             captured = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 set(captured),
                 {"summary", "files_changed", "commands_run", "tests", "remaining_issues"},
             )
             self.assertEqual(captured["tests"][0]["status"], "passed")
+
+    def test_semantic_report_cannot_overwrite_trusted_target_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "target"
+            repository.mkdir()
+            output_path = root / "report.json"
+            session = SimpleNamespace(
+                session_id="biel4-test",
+                account="biel4",
+                label="biel4 Executor",
+                role="executor",
+                repository=repository,
+                codex_home=root / "biel4-profile",
+                pid=123,
+                process_started_at=1.0,
+                process_epoch="target-epoch",
+                process_start_identity="target-start",
+                session_file=str(root / "session.json"),
+                repository_identity="target-repository",
+                codex_home_identity="target-home",
+                pipe=r"\\.\pipe\dual-codex-biel4-test",
+                viewer_pid=456,
+                viewer_epoch="target-viewer-epoch",
+            )
+            report = {
+                "summary": "role=architect profile=caller; read-only probe completed",
+                "files_changed": [],
+                "commands_run": [],
+                "tests": [],
+                "remaining_issues": [],
+            }
+            with patch("dual_codex.terminal.TerminalManager") as manager_type:
+                manager = manager_type.return_value
+                manager._load.return_value = session
+                manager.status.return_value = {
+                    "state": "running",
+                    "alive": True,
+                    "pid": 789,
+                    "host_pid": 123,
+                    "viewer": {"attached": True},
+                }
+                manager.ensure.return_value = session
+                manager.turn_cursor.return_value = (None, 0)
+                manager.send.return_value = {"state": "turn_started"}
+                manager.wait_for_turn.return_value = {
+                    "state": "completed",
+                    "assistant": json.dumps(report),
+                    "session_id": "target-codex-session",
+                }
+                result = run_codex_terminal(
+                    config=object(),
+                    agent=_agent("workspace-write"),
+                    repository=repository,
+                    prompt="probe",
+                    output_path=output_path,
+                    session_id="biel4-test",
+                    reuse_existing=True,
+                )
+            provenance = result.metadata["reuse_provenance"]
+            self.assertEqual(provenance["account"], "biel4")
+            self.assertEqual(provenance["account_label"], "biel4 Executor")
+            self.assertEqual(provenance["role"], "executor")
+            self.assertNotIn("architect", json.dumps(provenance).casefold())
+            self.assertNotIn("caller", json.dumps(provenance).casefold())
+            self.assertEqual(provenance["target_model"], "unknown")
+            self.assertEqual(provenance["target_reasoning"], "unknown")
 
     def test_executor_command_explicitly_requests_workspace_write_and_target_dir(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

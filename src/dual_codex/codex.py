@@ -141,14 +141,19 @@ def run_codex_terminal(
             add_dirs = ()
         else:
             add_dirs = (task_artifact_path.parent.resolve(),) if task_artifact_path is not None else ()
+        ensure_kwargs = {
+            "session_id": session_id,
+            "agent": agent,
+            "role": "executor" if agent.sandbox == "workspace-write" else "architect",
+            "repository": repository,
+            "approval_policy": "never" if agent.sandbox == "workspace-write" else "on-request",
+            "add_dirs": add_dirs,
+            "reuse_existing": reuse_existing,
+        }
+        if not reuse_existing:
+            ensure_kwargs["visible"] = agent.sandbox == "workspace-write"
         session = manager.ensure(
-            session_id=session_id,
-            agent=agent,
-            role="executor" if agent.sandbox == "workspace-write" else "architect",
-            repository=repository,
-            approval_policy="never" if agent.sandbox == "workspace-write" else "on-request",
-            add_dirs=add_dirs,
-            reuse_existing=reuse_existing,
+            **ensure_kwargs,
         )
         cursor = manager.turn_cursor(session.session_id)
         lease_owner = manager.begin_automation_turn(session.session_id)
@@ -160,6 +165,9 @@ def run_codex_terminal(
         assistant = result.get("assistant", "")
         report = _report_from_message(assistant)
         status_snapshot = manager.status(session.session_id)
+        readiness = getattr(manager, "_last_readiness_diagnostics", {})
+        if not isinstance(readiness, dict):
+            readiness = {}
         terminal_pid = int(status_snapshot.get("pid") or session.pid)
         host_pid = int(status_snapshot.get("host_pid") or session.pid)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +196,7 @@ def run_codex_terminal(
                     "terminal_pid": terminal_pid,
                     "host_pid": host_pid,
                     "account": session.account,
+                    "account_label": getattr(session, "label", ""),
                     "role": session.role,
                     "repository_identity": getattr(session, "repository_identity", "") or str(session.repository),
                     "codex_home_identity": getattr(session, "codex_home_identity", "") or str(session.codex_home),
@@ -198,6 +207,22 @@ def run_codex_terminal(
                     "host_pid": host_pid,
                     "process_started_at": getattr(session, "process_started_at", 0.0),
                     "pipe": getattr(session, "pipe", ""),
+                    "viewer_attached": bool(
+                        isinstance(status_snapshot.get("viewer"), dict)
+                        and status_snapshot["viewer"].get("attached") is True
+                    ),
+                    "viewer_pid": int(status_snapshot.get("viewer_pid") or getattr(session, "viewer_pid", 0) or 0),
+                    "viewer_epoch": str(
+                        status_snapshot.get("viewer_epoch")
+                        or getattr(session, "viewer_epoch", "")
+                        or ""
+                    ),
+                    "target_model": str(readiness.get("target_model") or "unknown"),
+                    "target_reasoning": str(readiness.get("target_reasoning") or "unknown"),
+                    "model_provenance": str(readiness.get("model_provenance") or "unavailable"),
+                    "reasoning_provenance": str(
+                        readiness.get("reasoning_provenance") or "unavailable"
+                    ),
                 },
             },
         )

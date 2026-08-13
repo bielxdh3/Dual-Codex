@@ -21,7 +21,12 @@ from .live_events import LiveEventJournal, repository_identity
 from .paths import path_identity_key
 from .process import CommandResult
 from .registry import login_status
-from .report import atomic_write_json, dump_json
+from .report import (
+    EXECUTOR_REPORT_FIELDS,
+    atomic_write_json,
+    dump_json,
+    normalise_executor_report,
+)
 
 
 def run_codex_exec(**kwargs):
@@ -735,7 +740,7 @@ def _prompt(request: DelegationRequest, diff: str = "") -> str:
     return "\n".join(lines)
 
 
-_REPORT_FIELDS = {"summary", "files_changed", "commands_run", "tests", "remaining_issues"}
+_REPORT_FIELDS = EXECUTOR_REPORT_FIELDS
 _REPORT_TEST_STATUSES = {"passed", "failed", "not_run"}
 
 
@@ -784,7 +789,7 @@ def _read_report(path: Path) -> tuple[dict[str, Any] | None, str]:
         return None, f"Executor report is not valid JSON: {exc}"
     if not isinstance(raw, dict):
         return None, "Executor report must be a JSON object."
-    sanitized = sanitize_value(raw)
+    sanitized = normalise_executor_report(sanitize_value(raw))
     validation_error = _validate_executor_report(sanitized)
     if validation_error:
         _write_text(path.with_suffix(".invalid.log"), raw_text)
@@ -799,7 +804,6 @@ def _report_list(report: Mapping[str, Any], name: str) -> list[Any]:
 
 
 _EXECUTOR_FAILURE_MARKERS = (
-    "read-only",
     "blocked",
     "rejected",
     "not applied",
@@ -814,6 +818,26 @@ _EXECUTOR_FAILURE_MARKERS = (
     "already complete",
     "already implemented",
 )
+_READ_ONLY_SUCCESS_MARKERS = (
+    "dual_codex_skill_attestation_ok",
+    "dual_codex_read_only_handshake_ok",
+    "read-only probe completed",
+)
+
+
+def _read_only_validation_succeeded(report: Mapping[str, Any]) -> bool:
+    """Accept only an explicit, no-mutation validation attestation."""
+    if _report_list(report, "files_changed"):
+        return False
+    evidence = [
+        str(report.get("summary", "")),
+        *[str(item) for item in _report_list(report, "remaining_issues")],
+    ]
+    for test in _report_list(report, "tests"):
+        if isinstance(test, Mapping):
+            evidence.append(str(test.get("details", "")))
+    text = "\n".join(evidence).casefold()
+    return any(marker in text for marker in _READ_ONLY_SUCCESS_MARKERS)
 
 
 def _classify_executor_result(
@@ -822,6 +846,7 @@ def _classify_executor_result(
     report_error: str,
     changed: list[str],
     command_result: CommandResult,
+    repository_unchanged: bool = False,
 ) -> tuple[str, str, str]:
     """Classify execution by its repository effect and report semantics."""
     if command_result.returncode != 0:
@@ -857,6 +882,9 @@ def _classify_executor_result(
             return "failed", summary, f"Executor reported a test with status '{test_status}'."
         if test_status != "passed":
             return "failed", summary, f"Executor reported an unsupported test status '{test_status}'."
+
+    if repository_unchanged and not report_error and _read_only_validation_succeeded(report):
+        return "completed", summary, report_error
 
     if not changed:
         return (
@@ -978,7 +1006,8 @@ def delegate(
     try:
         _emit(output, started, "[1/5] Validating request")
         ensure_git_repository(request.repository)
-        dirty = bool(status_porcelain(request.repository).strip())
+        initial_git_status = status_porcelain(request.repository)
+        dirty = bool(initial_git_status.strip())
         if dirty:
             if config.require_clean_git and not allow_dirty:
                 raise DelegationError(
@@ -1093,6 +1122,7 @@ def delegate(
                 report_error=report_error,
                 changed=changed,
                 command_result=command_result,
+                repository_unchanged=git_status == initial_git_status,
             )
             if head_changed:
                 status = "failed"
