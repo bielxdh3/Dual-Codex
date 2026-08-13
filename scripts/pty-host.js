@@ -53,10 +53,20 @@ let nextSequence = 1;
 const maxOutputChars = 250000;
 const maxOutputRecords = 8192;
 const maxInputBytes = 8192;
+const humanIdleLeaseMs = 5000;
+const humanConfigurationFallbackMs = 15000;
+const humanActiveLeaseMs = 3600000;
+const configurationIdleGraceMs = 750;
+const maxHumanComposerChars = 512;
 const leases = new Map();
+const viewers = new Map();
 let implicitWriter = "";
+let nextLeaseGeneration = 1;
 const state = {
   session_id: sessionId,
+  pipe: pipePath,
+  host_pid: process.pid,
+  host_started_at: Date.now() / 1000,
   pid: null,
   alive: true,
   started_at: new Date().toISOString(),
@@ -78,6 +88,7 @@ function appendOutput(data) {
   state.output_chars += text.length;
   state.last_activity = new Date().toISOString();
   while (outputChars > maxOutputChars || output.length > maxOutputRecords) outputChars -= output.shift().text.length;
+  observeConfigurationOutput(text);
   const buffered = output.map((item) => item.text).join("");
   if (!updatePromptHandled && buffered.includes("Update now") && buffered.includes("Skip")) {
     updatePromptHandled = true;
@@ -94,12 +105,16 @@ function response(socket, value) {
 
 let terminal;
 try {
+  const terminalEnvironment = { ...process.env };
+  if (!terminalEnvironment.TERM || terminalEnvironment.TERM.toLowerCase() === "dumb") {
+    terminalEnvironment.TERM = "xterm-256color";
+  }
   terminal = pty.spawn(process.env.ComSpec || "C:\\Windows\\System32\\cmd.exe", ["/d"], {
     name: "xterm-color",
     cols: 160,
     rows: 50,
     cwd,
-    env: process.env,
+    env: terminalEnvironment,
   });
   state.pid = terminal.pid;
   terminal.onData(appendOutput);
@@ -173,9 +188,218 @@ function liveOutput(since, maxBytes, offset = 0) {
 
 function leaseSnapshot() {
   const now = Date.now();
-  for (const [owner, lease] of leases) if (lease.expires_at <= now) leases.delete(owner);
+  for (const [owner, lease] of leases) {
+    const ownerAlive = !lease.owner_pid || processAlive(lease.owner_pid);
+    const humanIdle = lease.mode === "human"
+      && !lease.composition_active
+      && !lease.command_pending
+      && !lease.configuration_pending
+      && now - lease.last_actual_input_at >= humanIdleLeaseMs;
+    if (lease.expires_at <= now || !ownerAlive || humanIdle) dropLease(owner);
+  }
   const lease = [...leases.values()][0];
-  return lease ? { active: true, owner: lease.owner, mode: lease.mode, expires_at: new Date(lease.expires_at).toISOString() } : { active: false };
+  return lease ? {
+    active: true,
+    owner: lease.owner,
+    mode: lease.mode,
+    generation: lease.generation,
+    acquired_at: new Date(lease.acquired_at).toISOString(),
+    last_actual_input_at: new Date(lease.last_actual_input_at).toISOString(),
+    last_output_at: new Date(lease.last_output_at).toISOString(),
+    expires_at: new Date(lease.expires_at).toISOString(),
+    composition_active: Boolean(lease.composition_active),
+    configuration_pending: Boolean(lease.configuration_pending),
+    command_pending: Boolean(lease.command_pending),
+    reason: lease.reason,
+  } : { active: false };
+}
+
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error && error.code === "EPERM") return true;
+    return false;
+  }
+}
+
+function validViewerEpoch(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{16,96}$/.test(value)) {
+    throw new Error("invalid viewer epoch");
+  }
+  return value;
+}
+
+function viewerSnapshot() {
+  for (const [owner, viewer] of viewers) {
+    if (!processAlive(viewer.pid)) viewers.delete(owner);
+  }
+  const viewer = [...viewers.values()][0];
+  return viewer ? {
+    attached: true,
+    owner: viewer.owner,
+    pid: viewer.pid,
+    process_start_identity: viewer.process_start_identity,
+    viewer_epoch: viewer.viewer_epoch,
+    attached_at: new Date(viewer.attached_at).toISOString(),
+  } : { attached: false };
+}
+
+function dropLease(owner) {
+  leases.delete(owner);
+  if (implicitWriter === owner) implicitWriter = "";
+}
+
+function createLease(owner, mode, ttl, ownerPid = 0) {
+  const now = Date.now();
+  const initialTtl = mode === "human" ? humanIdleLeaseMs : ttl;
+  const lease = {
+    owner,
+    mode,
+    generation: nextLeaseGeneration++,
+    owner_pid: Number.isInteger(ownerPid) && ownerPid > 0 ? ownerPid : 0,
+    acquired_at: now,
+    last_actual_input_at: now,
+    last_output_at: now,
+    expires_at: now + initialTtl,
+    composition_active: false,
+    configuration_pending: false,
+    command_pending: false,
+    configuration_idle_prompt: false,
+    configuration_output: "",
+    composer: "",
+    reason: mode === "human" ? "human_attach" : "automation_turn",
+  };
+  leases.set(owner, lease);
+  return lease;
+}
+
+function validGeneration(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const generation = Number(value);
+  if (!Number.isInteger(generation) || generation < 1) throw new Error("invalid input lease generation");
+  return generation;
+}
+
+function validOwnerPid(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const pid = Number(value);
+  if (!Number.isInteger(pid) || pid < 1 || pid > 0x7fffffff) throw new Error("invalid input lease owner process");
+  return pid;
+}
+
+function leaseGenerationMatches(lease, request) {
+  const generation = validGeneration(request.generation);
+  return !generation || lease.generation === generation;
+}
+
+function stripAnsi(text) {
+  return String(text).replace(/\x1b(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "");
+}
+
+function hasIdleComposer(text) {
+  const clean = stripAnsi(text);
+  return /(?:^|\n)\s*[›>]\s/.test(clean)
+    && /(?:^|\n).*model:\s+\S+/i.test(clean);
+}
+
+function scheduleConfigurationRelease(owner, generation) {
+  setTimeout(() => {
+    const lease = leases.get(owner);
+    if (!lease || lease.mode !== "human" || lease.generation !== generation || !lease.configuration_pending) return;
+    if (!lease.configuration_idle_prompt) return;
+    const remaining = configurationIdleGraceMs - (Date.now() - lease.last_output_at);
+    if (remaining > 0) {
+      setTimeout(() => scheduleConfigurationRelease(owner, generation), remaining);
+      return;
+    }
+    dropLease(owner);
+  }, configurationIdleGraceMs);
+}
+
+function observeConfigurationOutput(text) {
+  for (const lease of leases.values()) {
+    if (lease.mode !== "human" || !lease.configuration_pending) continue;
+    lease.configuration_output = (lease.configuration_output + String(text)).slice(-8192);
+    lease.last_output_at = Date.now();
+    lease.expires_at = lease.last_output_at + humanConfigurationFallbackMs;
+    if (hasIdleComposer(lease.configuration_output)) {
+      lease.configuration_idle_prompt = true;
+      scheduleConfigurationRelease(lease.owner, lease.generation);
+    }
+  }
+}
+
+function recordHumanInput(owner, data) {
+  const lease = leases.get(owner);
+  if (!lease || lease.mode !== "human") return;
+  const now = Date.now();
+  lease.last_actual_input_at = now;
+  lease.reason = "human_input";
+  lease.expires_at = now + (lease.composition_active ? humanActiveLeaseMs : humanIdleLeaseMs);
+  let submitted = false;
+  let visible = false;
+  for (let index = 0; index < data.length; index += 1) {
+    const char = data[index];
+    if (char === "\x1b") {
+      while (index + 1 < data.length) {
+        index += 1;
+        if (/[A-Za-z~]/.test(data[index])) break;
+      }
+      continue;
+    }
+    if (char === "\r" || char === "\n") {
+      submitted = true;
+      continue;
+    }
+    if (char === "\b" || char === "\x7f") {
+      lease.composer = lease.composer.slice(0, -1);
+      visible = true;
+      continue;
+    }
+    if (char >= " ") {
+      lease.composer = (lease.composer + char).slice(-maxHumanComposerChars);
+      visible = true;
+    }
+  }
+  if (submitted) {
+    const command = lease.composer.trim().toLowerCase();
+    const configurationCommand = /^\/(?:model|reasoning(?:_effort)?)(?:\s|$)/.test(command);
+    if (!lease.configuration_pending) lease.configuration_pending = configurationCommand;
+    if (lease.configuration_pending) {
+      lease.configuration_output = "";
+      lease.configuration_idle_prompt = false;
+      lease.last_output_at = now;
+      lease.expires_at = now + humanConfigurationFallbackMs;
+      lease.reason = "configuration_command_submitted";
+    } else {
+      lease.reason = "human_command_submitted";
+      lease.command_pending = true;
+    }
+    lease.composer = "";
+    lease.composition_active = false;
+    return;
+  }
+  if (visible && !lease.configuration_pending) {
+    lease.composition_active = lease.composer.length > 0;
+    lease.expires_at = now + (lease.composition_active ? humanActiveLeaseMs : humanIdleLeaseMs);
+  }
+  if (lease.configuration_pending) lease.expires_at = now + humanConfigurationFallbackMs;
+}
+
+function acquireLease(owner, mode, ttl, ownerPid = 0) {
+  const current = leaseSnapshot();
+  if (current.active && current.owner !== owner) throw new Error("terminal input is busy; attached viewer is watch-only");
+  const existing = leases.get(owner);
+  if (existing && existing.owner === owner) {
+    existing.mode = mode;
+    existing.owner_pid = ownerPid || existing.owner_pid;
+    existing.expires_at = Date.now() + (mode === "human" ? humanIdleLeaseMs : ttl);
+    return existing;
+  }
+  return createLease(owner, mode, ttl, ownerPid);
 }
 
 function validOwner(value) {
@@ -188,10 +412,13 @@ function writerFor(request, { autoLease = false } = {}) {
   const current = leaseSnapshot();
   if (!current.active) {
     if (!autoLease) throw new Error("terminal input is not leased");
-    leases.set(requested, { owner: requested, mode: "automation", expires_at: Date.now() + 900000 });
+    acquireLease(requested, request.mode === "human" ? "human" : "automation", 900000, validOwnerPid(request.owner_pid));
     implicitWriter = requested;
   } else if (current.owner !== requested) {
     throw new Error("terminal input is busy");
+  } else {
+    const lease = leases.get(requested);
+    if (lease && !leaseGenerationMatches(lease, request)) throw new Error("terminal input lease generation is stale");
   }
   return requested;
 }
@@ -200,7 +427,20 @@ function handle(socket, request) {
   if (!request || typeof request !== "object") throw new Error("request must be an object");
   switch (request.op) {
     case "status":
-      return response(socket, { ok: true, state: { ...state, input_lease: leaseSnapshot() } });
+      {
+        const viewer = viewerSnapshot();
+        return response(socket, {
+          ok: true,
+          state: {
+            ...state,
+            input_lease: leaseSnapshot(),
+            viewer,
+            viewer_attached: Boolean(viewer.attached),
+            viewer_pid: viewer.pid || null,
+            viewer_epoch: viewer.viewer_epoch || "",
+          },
+        });
+      }
     case "read":
       return response(socket, { ok: true, output: tail(request.lines) });
     case "read_since":
@@ -210,25 +450,59 @@ function handle(socket, request) {
       const mode = request.mode;
       const ttl = Number(request.ttl_ms);
       if (!["automation", "human"].includes(mode) || !Number.isInteger(ttl) || ttl < 100 || ttl > 3600000) throw new Error("invalid input lease");
-      const current = leaseSnapshot();
-      if (current.active && current.owner !== owner) throw new Error("terminal input is busy; attached viewer is watch-only");
-      leases.set(owner, { owner, mode, expires_at: Date.now() + ttl });
+      acquireLease(owner, mode, ttl, validOwnerPid(request.owner_pid));
       return response(socket, { ok: true, lease_acquired: true, input_lease: leaseSnapshot() });
     }
     case "renew_input_lease": {
       const owner = validOwner(request.owner);
       const ttl = Number(request.ttl_ms);
-      if (!Number.isInteger(ttl) || ttl < 100 || ttl > 3600000 || !leaseSnapshot().active || leaseSnapshot().owner !== owner) throw new Error("input lease is not owned by this client");
-      leases.set(owner, { ...leases.get(owner), expires_at: Date.now() + ttl });
+      const current = leaseSnapshot();
+      const lease = leases.get(owner);
+      if (!Number.isInteger(ttl) || ttl < 100 || ttl > 3600000 || !current.active || current.owner !== owner || !lease || !leaseGenerationMatches(lease, request)) throw new Error("input lease is not owned by this client");
+      lease.expires_at = Date.now() + ttl;
       return response(socket, { ok: true, input_lease: leaseSnapshot() });
     }
     case "release_input_lease": {
       const owner = validOwner(request.owner);
       const current = leaseSnapshot();
+      const lease = leases.get(owner);
       if (current.active && current.owner !== owner) throw new Error("input lease is owned by another client");
-      leases.delete(owner);
-      if (implicitWriter === owner) implicitWriter = "";
+      if (lease && !leaseGenerationMatches(lease, request)) throw new Error("input lease generation is stale");
+      dropLease(owner);
       return response(socket, { ok: true, input_lease: leaseSnapshot() });
+    }
+    case "register_viewer": {
+      const owner = validOwner(request.owner);
+      const pid = validOwnerPid(request.viewer_pid);
+      if (!pid) throw new Error("viewer process is required");
+      const viewerEpoch = validViewerEpoch(request.viewer_epoch);
+      const processStartIdentity = typeof request.process_start_identity === "string"
+        && /^[A-Za-z0-9_.:-]{0,160}$/.test(request.process_start_identity)
+        ? request.process_start_identity
+        : "";
+      for (const [currentOwner, current] of viewers) {
+        if (currentOwner !== owner && processAlive(current.pid)) {
+          throw new Error("terminal viewer is already attached");
+        }
+        viewers.delete(currentOwner);
+      }
+      viewers.set(owner, {
+        owner,
+        pid,
+        process_start_identity: processStartIdentity,
+        viewer_epoch: viewerEpoch,
+        attached_at: Date.now(),
+      });
+      return response(socket, { ok: true, viewer: viewerSnapshot() });
+    }
+    case "unregister_viewer": {
+      const owner = validOwner(request.owner);
+      const current = viewers.get(owner);
+      if (current && request.viewer_epoch && current.viewer_epoch !== validViewerEpoch(request.viewer_epoch)) {
+        throw new Error("viewer epoch is stale");
+      }
+      viewers.delete(owner);
+      return response(socket, { ok: true, viewer: viewerSnapshot() });
     }
     case "send_text":
       if (typeof request.message !== "string" || request.message.length === 0 || request.message.length > 500) throw new Error("message must be non-empty text of at most 500 characters");
@@ -246,11 +520,12 @@ function handle(socket, request) {
       return response(socket, { ok: true });
     case "write_input": {
       const data = request.data;
-      writerFor(request);
+      const writer = writerFor(request, { autoLease: Boolean(request.auto_lease) });
       if (typeof data !== "string" || !data || Buffer.byteLength(data, "utf8") > maxInputBytes || data.includes("\u0000")) throw new Error("raw input is invalid or too large");
+      if (request.mode === "human" || leases.get(writer)?.mode === "human") recordHumanInput(writer, data);
       terminal.write(data);
       state.last_activity = new Date().toISOString();
-      return response(socket, { ok: true, bytes: Buffer.byteLength(data, "utf8") });
+      return response(socket, { ok: true, bytes: Buffer.byteLength(data, "utf8"), generation: leases.get(writer)?.generation || 0, lease_acquired: Boolean(request.auto_lease) });
     }
     case "resize": {
       const cols = Number(request.cols);

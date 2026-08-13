@@ -19,18 +19,22 @@ from dual_codex.cli import _VtKeyBuffer, _WindowsConsoleModes, _interactive_atta
 from dual_codex.paths import same_path
 from dual_codex.terminal import (
     TerminalError,
+    TerminalSession,
     TerminalManager,
     TERMINAL_INLINE_MESSAGE_MAX,
+    TERMINAL_TERM,
     TERMINAL_SUBMIT_DELAY_SECONDS,
     TuiComposerAckDetector,
     TuiReadinessDetector,
     TuiTurnStartDetector,
+    TerminalLifecyclePolicy,
     find_session_file,
     interactive_command_args,
     session_id_for,
     session_turn_started,
     session_turn_state,
     _rollout_snapshot,
+    _terminal_environment,
     executor_task_artifact_dir,
     validate_control_message,
     validate_pipe_name,
@@ -141,6 +145,64 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
         result = subprocess.run([shutil.which("node") or "node", "-"], input=script, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for the human lease regression")
+    def test_pty_human_configuration_lease_releases_but_composition_stays_owned(self) -> None:
+        source = (Path(__file__).parents[1] / "scripts" / "pty-host.js").read_text(encoding="utf-8")
+        start = source.index("function leaseSnapshot")
+        end = source.index("function handle")
+        script = f"""
+const source = {json.dumps(source)};
+const leases = new Map();
+let implicitWriter = "";
+let nextLeaseGeneration = 1;
+const humanIdleLeaseMs = 5000;
+const humanConfigurationFallbackMs = 15000;
+const humanActiveLeaseMs = 3600000;
+const configurationIdleGraceMs = 750;
+const maxHumanComposerChars = 512;
+eval(source.slice({start}, {end}) + `
+globalThis.__leaseTest = {{ acquireLease, recordHumanInput, observeConfigurationOutput, leaseSnapshot }};`);
+const acquireLeaseTest = globalThis.__leaseTest.acquireLease;
+const recordHumanInputTest = globalThis.__leaseTest.recordHumanInput;
+const observeConfigurationOutputTest = globalThis.__leaseTest.observeConfigurationOutput;
+const leaseSnapshotTest = globalThis.__leaseTest.leaseSnapshot;
+
+function idleScreen(model) {{
+  return `\\u2502 >_ OpenAI Codex\\n\\u2502 model:     ${{model}}\\n\\u2502 directory: E:\\\\BielOS\\n\\u203a `;
+}}
+
+(async () => {{
+  acquireLeaseTest("human:test", "human", 3600000);
+  recordHumanInputTest("human:test", "/model\\r");
+  observeConfigurationOutputTest(idleScreen("gpt-5.6-luna"));
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  if (leaseSnapshotTest().active) throw new Error("model configuration lease remained active");
+
+  acquireLeaseTest("human:test", "human", 3600000);
+  recordHumanInputTest("human:test", "/reasoning\\r");
+  observeConfigurationOutputTest(idleScreen("gpt-5.6-luna"));
+  await new Promise((resolve) => setTimeout(resolve, 900));
+  if (leaseSnapshotTest().active) throw new Error("reasoning configuration lease remained active");
+
+  acquireLeaseTest("human:test", "human", 3600000);
+  recordHumanInputTest("human:test", "draft that is still being composed");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const active = leaseSnapshotTest();
+  if (!active.active || !active.composition_active) throw new Error("active composition was not protected");
+  try {{ acquireLeaseTest("automation:test", "automation", 900000); throw new Error("concurrent writer acquired the lease"); }}
+  catch (error) {{ if (!String(error.message).includes("busy")) throw error; }}
+
+  acquireLeaseTest("human:test", "human", 3600000);
+  recordHumanInputTest("human:test", "safe command\\r");
+  const submitted = leaseSnapshotTest();
+  if (!submitted.active || !submitted.command_pending) throw new Error("submitted human command was not protected");
+  try {{ acquireLeaseTest("automation:test", "automation", 900000); throw new Error("automation acquired during human turn"); }}
+  catch (error) {{ if (!String(error.message).includes("busy")) throw error; }}
+}})().catch((error) => {{ console.error(error.stack || error); process.exit(1); }});
+"""
+        result = subprocess.run([shutil.which("node") or "node", "-"], input=script, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_strict_reuse_requires_registered_identity_and_transport(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -169,6 +231,9 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
                 process_epoch="epoch",
                 pid=123,
                 task_artifact_dir=transport,
+                viewer_pid=456,
+                viewer_process_start_identity="viewer-start",
+                viewer_epoch="viewer-epoch-123456",
             )
             agent = AgentConfig(
                 codex_home=codex_home,
@@ -185,12 +250,18 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
                 "host_pid": 123,
                 "process_epoch": "epoch",
                 "input_lease": {"active": False},
+                "viewer": {
+                    "attached": True,
+                    "pid": 456,
+                    "process_start_identity": "viewer-start",
+                    "viewer_epoch": "viewer-epoch-123456",
+                },
             }
             with patch.object(manager, "_load", return_value=session), patch.object(
                 manager, "status", return_value=status
             ), patch.object(manager, "wait_until_ready"), patch.object(
                 manager, "_codex_turn_activity", return_value={"active": False}
-            ):
+            ), patch("dual_codex.terminal._process_start_identity", return_value="viewer-start"):
                 self.assertIs(
                     manager.reuse_existing(
                         session_id=session_id,
@@ -305,6 +376,156 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
                     repository=repository,
                 )
 
+    def test_strict_reuse_refuses_headless_executor_even_when_host_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            repository.mkdir()
+            config = _config(root, repository)
+            transport = executor_task_artifact_dir(config, create=True)
+            record = config.runs_dir / "terminal-sessions" / "executor.json"
+            record.parent.mkdir(parents=True)
+            session = TerminalSession(
+                session_id="executor",
+                account="executor",
+                label="Executor",
+                role="executor",
+                repository=repository,
+                codex_home=root / "codex-home",
+                pipe=r"\\.\pipe\dual-codex-executor-aaaaaaaaaaaaaaaa",
+                pid=123,
+                started_at="now",
+                log_file=record.with_suffix(".log"),
+                session_file=str(record.resolve()),
+                process_epoch="epoch",
+                add_dirs=(transport,),
+                task_artifact_dir=transport,
+            )
+            session.codex_home.mkdir()
+            record.write_text(json.dumps(session.as_dict()), encoding="utf-8")
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            agent = AgentConfig(
+                codex_home=session.codex_home,
+                model="",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="executor",
+                label="Executor",
+            )
+            with patch.object(manager, "status", return_value={
+                "state": "running",
+                "identity_match": True,
+                "host_pid": 123,
+                "process_epoch": "epoch",
+                "input_lease": {"active": False},
+                "viewer": {"attached": False},
+            }), self.assertRaisesRegex(TerminalError, "visible interactive Executor viewer"):
+                manager.reuse_existing(
+                    session_id="executor",
+                    agent=agent,
+                    role="executor",
+                    repository=repository,
+                    add_dirs=(transport,),
+                )
+
+    def test_visible_viewer_launcher_uses_attach_client_without_codex_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            repository.mkdir()
+            config = _config(root, repository)
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            session = TerminalSession(
+                session_id="executor",
+                account="executor",
+                label="Executor",
+                role="executor",
+                repository=repository,
+                codex_home=root / "codex-home",
+                pipe=r"\\.\pipe\dual-codex-executor-aaaaaaaaaaaaaaaa",
+                pid=123,
+                started_at="now",
+                log_file=root / "terminal.log",
+                session_file=str(config.runs_dir / "terminal-sessions" / "executor.json"),
+            )
+            class ViewerProcess:
+                pid = 456
+
+            with patch("dual_codex.terminal.os.name", "nt"), patch(
+                "dual_codex.terminal.shutil.which",
+                side_effect=lambda name: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+                if name == "powershell.exe" else None,
+            ), patch(
+                "dual_codex.terminal.subprocess.Popen", return_value=ViewerProcess()
+            ) as popen, patch("dual_codex.terminal._process_start_identity", return_value="viewer-start"), patch(
+                "dual_codex.terminal.atomic_write_json"
+            ):
+                updated = manager._launch_visible_viewer(session, "viewer-epoch-123456")
+            command = [str(item) for item in popen.call_args.args[0]]
+            self.assertTrue(command[0].lower().endswith("powershell.exe"))
+            self.assertIn("dual_codex.cli", command[-1])
+            self.assertIn("--interactive", command[-1])
+            self.assertNotRegex(command[-1], r"(?i)(^|[\s'])exec($|[\s'])")
+            self.assertEqual(updated.viewer_pid, 456)
+            self.assertEqual(updated.viewer_epoch, "viewer-epoch-123456")
+
+    def test_visible_viewer_falls_back_to_native_cmd(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repository"
+            repository.mkdir()
+            config = _config(root, repository)
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            session = TerminalSession(
+                session_id="executor",
+                account="executor",
+                label="Executor",
+                role="executor",
+                repository=repository,
+                codex_home=root / "codex-home",
+                pipe=r"\\.\pipe\dual-codex-executor-aaaaaaaaaaaaaaaa",
+                pid=123,
+                started_at="now",
+                log_file=root / "terminal.log",
+                session_file=str(config.runs_dir / "terminal-sessions" / "executor.json"),
+            )
+
+            class ViewerProcess:
+                pid = 456
+
+            with patch("dual_codex.terminal.os.name", "nt"), patch(
+                "dual_codex.terminal.shutil.which", return_value=None
+            ), patch.dict("dual_codex.terminal.os.environ", {"ComSpec": r"C:\Windows\System32\cmd.exe"}), patch(
+                "dual_codex.terminal.subprocess.Popen", return_value=ViewerProcess()
+            ) as popen, patch("dual_codex.terminal._process_start_identity", return_value="viewer-start"), patch(
+                "dual_codex.terminal.atomic_write_json"
+            ):
+                manager._launch_visible_viewer(session, "viewer-epoch-123456")
+
+            command = [str(item) for item in popen.call_args.args[0]]
+            self.assertTrue(command[0].lower().endswith("cmd.exe"))
+            self.assertEqual(command[1:3], ["/d", "/s"])
+            self.assertIn("dual_codex.cli", command[-1])
+            self.assertNotRegex(command[-1], r"(?i)(^|[\s'])exec($|[\s'])")
+
+    def test_terminal_environment_replaces_dumb_term_without_leaking_keys(self) -> None:
+        agent = AgentConfig(
+            codex_home=Path("C:/CodexProfiles/executor"),
+            model="",
+            reasoning_effort="high",
+            sandbox="workspace-write",
+            account_name="executor",
+            label="Executor",
+            backend="windows",
+        )
+        with patch.dict(os.environ, {"TERM": "dumb", "OPENAI_API_KEY": "must-not-pass"}):
+            environment = _terminal_environment(agent)
+        self.assertEqual(environment["TERM"], TERMINAL_TERM)
+        self.assertNotIn("OPENAI_API_KEY", environment)
+
     def test_raw_input_requires_named_writer(self) -> None:
         manager = TerminalManager.__new__(TerminalManager)
         session = SimpleNamespace(pipe=r"\\.\pipe\dual-codex-biel4-session-aaaaaaaaaaaaaaaa")
@@ -313,6 +534,46 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
         ) as request:
             manager.write_input("biel4-session", "\x1b[A", "human:viewer")
         self.assertEqual(request.call_args.args[1], {"op": "write_input", "owner": "human:viewer", "data": "\x1b[A"})
+
+    def test_ensure_consumes_visible_before_strict_reuse(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        manager.reuse_existing = lambda **kwargs: kwargs
+        forwarded = manager.ensure(
+            session_id="executor-session",
+            agent=object(),
+            role="executor",
+            repository=Path("."),
+            reuse_existing=True,
+            visible=False,
+        )
+        self.assertNotIn("visible", forwarded)
+
+    def test_human_input_can_reacquire_an_idle_lease_atomically(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        session = SimpleNamespace(pipe=r"\\.\pipe\dual-codex-biel4-session-aaaaaaaaaaaaaaaa")
+        with patch.object(manager, "_load", return_value=session), patch(
+            "dual_codex.terminal._pipe_request", return_value={"ok": True, "generation": 4}
+        ) as request:
+            result = manager.write_input(
+                "biel4-session",
+                "m",
+                "human:viewer",
+                generation=3,
+                auto_lease=True,
+            )
+        self.assertEqual(result["generation"], 4)
+        self.assertEqual(
+            request.call_args.args[1],
+            {
+                "op": "write_input",
+                "owner": "human:viewer",
+                "data": "m",
+                "generation": 3,
+                "auto_lease": True,
+                "mode": "human",
+                "owner_pid": os.getpid(),
+            },
+        )
 
     def test_resize_is_bounded_and_uses_existing_session_pipe(self) -> None:
         manager = TerminalManager.__new__(TerminalManager)
@@ -441,8 +702,20 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
         self.assertEqual(
             manager.write_input.call_args_list,
             [
-                unittest.mock.call("biel4-session", "\x1b[B", "human:test"),
-                unittest.mock.call("biel4-session", "\x1b[A", "human:test"),
+                unittest.mock.call(
+                    "biel4-session",
+                    "\x1b[B",
+                    "human:test",
+                    generation=None,
+                    auto_lease=True,
+                ),
+                unittest.mock.call(
+                    "biel4-session",
+                    "\x1b[A",
+                    "human:test",
+                    generation=None,
+                    auto_lease=True,
+                ),
             ],
         )
         manager.detach_interactive.assert_called_once_with("biel4-session", "human:test")
@@ -455,6 +728,34 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
         attached = manager.attach_interactive("biel4-session")
         self.assertTrue(attached["viewer_only"])
         manager.acquire_input_lease.assert_called_once()
+
+    def test_completed_human_command_release_requires_observed_turn_completion(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        manager.status = unittest.mock.Mock(
+            return_value={
+                "input_lease": {
+                    "active": True,
+                    "owner": "human:test",
+                    "mode": "human",
+                    "composition_active": False,
+                    "configuration_pending": False,
+                    "reason": "human_command_submitted",
+                }
+            }
+        )
+        manager._load = unittest.mock.Mock(return_value=SimpleNamespace())
+        manager._codex_turn_activity = unittest.mock.Mock(return_value={"active": False})
+        manager.release_input_lease = unittest.mock.Mock()
+        self.assertFalse(manager.release_completed_human_command("biel4-session", "human:test", turn_seen=False))
+        self.assertTrue(
+            manager.release_completed_human_command(
+                "biel4-session",
+                "human:test",
+                generation=7,
+                turn_seen=True,
+            )
+        )
+        manager.release_input_lease.assert_called_once_with("biel4-session", "human:test", generation=7)
 
     def test_session_id_is_stable_and_scoped_to_account_and_repository(self) -> None:
         same_path_a = Path(r"C:\Work Tree\target")
@@ -563,6 +864,11 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
                 self.assertEqual(detector.feed(tail), detector.NOT_READY)
                 self.assertEqual(detector.feed(tail), detector.READY)
                 self.assertTrue(detector.seen_model_ready)
+                diagnostics = detector.diagnostics()
+                self.assertEqual(diagnostics["target_model"], "gpt-5.6-sol")
+                self.assertEqual(diagnostics["target_reasoning"], "high")
+                self.assertEqual(diagnostics["model_provenance"], "tui_readiness")
+                self.assertEqual(diagnostics["reasoning_provenance"], "tui_readiness")
 
     def test_readiness_rejects_ambiguous_post_turn_tail(self) -> None:
         detector = TuiReadinessDetector()
@@ -588,6 +894,13 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
                 self.assertEqual(detector.feed(sample), detector.NOT_READY)
                 self.assertEqual(detector.feed(sample), detector.NOT_READY)
                 self.assertFalse(detector.seen_ready)
+
+    def test_persistent_reuse_accepts_stable_idle_prompt_after_long_output(self) -> None:
+        detector = TuiReadinessDetector(allow_idle_prompt=True)
+        idle = "\u203a Find and fix a bug in @filename\n  gpt-5.6-luna high \u00b7 E:\\BielOS\n"
+        self.assertEqual(detector.feed(idle), detector.NOT_READY)
+        self.assertEqual(detector.feed(idle), detector.READY)
+        self.assertEqual(detector.ready_evidence, "stable idle composer marker for verified persistent session")
 
     def test_readiness_handles_partial_ansi_and_trust_setup(self) -> None:
         setup = TuiReadinessDetector()
@@ -687,7 +1000,7 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
             cursor = manager.turn_cursor("executor-session")
             self.assertEqual(cursor, (associated, associated.stat().st_size))
 
-            with associated.open("a", encoding="utf-8") as stream:
+            with associated.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.write(json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n")
                 stream.write(
                     json.dumps(
@@ -710,6 +1023,52 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
             self.assertEqual(result["assistant"], "second turn")
             self.assertEqual(result["session_id"], "persistent")
             self.assertEqual(result["session_file"], str(associated))
+
+    def test_persistent_turn_cursor_uses_associated_rollout_when_mtime_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            path = root / "sessions" / "2026" / "08" / "07" / "rollout-stale-mtime.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps({"type": "session_meta", "payload": {"session_id": "codex-1", "cwd": str(repository)}})
+                + "\n"
+                + json.dumps({"type": "event_msg", "payload": {"type": "task_completed"}})
+                + "\n",
+                encoding="utf-8",
+            )
+            session = SimpleNamespace(codex_home=root, repository=repository, codex_session_id="codex-1")
+            manager = TerminalManager.__new__(TerminalManager)
+            manager._load = lambda _session_id: session
+
+            with patch("dual_codex.terminal.find_session_file", return_value=None):
+                cursor_path, cursor_offset = manager.turn_cursor("biel4-test")
+
+            self.assertEqual(cursor_path, path)
+            self.assertEqual(cursor_offset, path.stat().st_size)
+            with path.open("a", encoding="utf-8", newline="\n") as stream:
+                stream.write(
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"text": "new result"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                    + json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}})
+                    + "\n"
+                )
+
+            with patch("dual_codex.terminal.find_session_file", return_value=None):
+                result = manager.wait_for_turn("biel4-test", cursor=(cursor_path, cursor_offset))
+
+            self.assertEqual(result["state"], "completed")
+            self.assertEqual(result["assistant"], "new result")
 
     def test_registered_session_cursor_rejects_missing_and_unrelated_rollouts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -955,6 +1314,7 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
 
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0]["op"], "send_text")
+        self.assertFalse(manager._input_leases["biel4-test"].locked())
 
     def test_oversized_followup_uses_file_transport_and_short_control_message(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1001,7 +1361,7 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
         with self.assertRaisesRegex(TerminalError, "task body"):
             validate_control_message("read task body", forbidden_text="task body")
 
-    def test_turn_start_timeout_does_not_resend_and_writes_diagnostics(self) -> None:
+    def test_turn_start_timeout_preserves_reusable_tui_and_writes_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repository = root / "repo"
@@ -1013,7 +1373,9 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
             manager.config = config
             manager._load = lambda _session_id: session
             manager.read = lambda _session_id, _lines: "\u203a task in composer\n"
-            manager.terminate = lambda _session_id: None
+            terminated: list[str] = []
+            manager.terminate = lambda session_id: terminated.append(session_id)
+            manager._terminal_health = lambda _session: "alive"
             clock = iter((0.0, 0.1, 0.2))
 
             with patch("dual_codex.terminal.find_session_file", return_value=None), patch(
@@ -1028,21 +1390,25 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
 
             self.assertIn("[turn-start-diagnostics]", log_file.read_text(encoding="utf-8"))
             self.assertIn("resend_attempted", log_file.read_text(encoding="utf-8"))
+            self.assertEqual(terminated, [])
 
-    def test_readiness_timeout_writes_diagnostics_and_terminates(self) -> None:
+    def test_readiness_timeout_preserves_persistent_session_and_writes_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repository = root / "repo"
             repository.mkdir()
             log_file = root / "session.pty.log"
             config = _config(root, repository)
-            session = SimpleNamespace(log_file=log_file)
+            session = SimpleNamespace(
+                session_id="biel4-test",
+                log_file=log_file,
+                pipe=r"\\.\pipe\dual-codex-biel4-test",
+            )
             manager = TerminalManager.__new__(TerminalManager)
             manager.config = config
             manager._load = lambda _session_id: session
             manager.read = lambda _session_id, _lines: ""
-            terminated: list[str] = []
-            manager.terminate = lambda session_id: terminated.append(session_id)
+            manager._terminal_health = lambda _session: "alive"
             clock = iter((0.0, 0.1, 0.2))
 
             with patch("dual_codex.terminal.time.monotonic", side_effect=lambda: next(clock)), patch(
@@ -1050,8 +1416,138 @@ if (replay !== "\\u001b[38;2;1;2;3mol\\u00e1\\u001b[0m") throw new Error(JSON.st
             ), self.assertRaisesRegex(TerminalError, "Timed out"):
                 manager.wait_until_ready("biel4-test", timeout=0.01)
 
-            self.assertEqual(terminated, ["biel4-test"])
-            self.assertIn("[readiness-diagnostics]", log_file.read_text(encoding="utf-8"))
+            diagnostics = log_file.read_text(encoding="utf-8")
+            self.assertIn("[readiness-diagnostics]", diagnostics)
+            self.assertIn('"lifecycle_policy": "persistent_reuse"', diagnostics)
+            self.assertIn('"terminal_health": "alive"', diagnostics)
+
+    def test_startup_readiness_failure_still_cleans_up_new_host(self) -> None:
+        manager = TerminalManager.__new__(TerminalManager)
+        session = SimpleNamespace(session_id="new-session")
+        terminated: list[str] = []
+        manager._load = lambda _session_id: session
+        manager.terminate = lambda session_id: terminated.append(session_id)
+        manager._handle_attempt_failure(
+            session,
+            {},
+            TerminalLifecyclePolicy.STARTUP,
+            session_id="new-session",
+        )
+        self.assertEqual(terminated, ["new-session"])
+
+    def test_list_reconciles_confirmed_dead_session_but_keeps_transient_unreachable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            config = _config(root, repository)
+            sessions = config.runs_dir / "terminal-sessions"
+            sessions.mkdir(parents=True)
+            session = TerminalSession(
+                session_id="biel4-dead",
+                account="biel4",
+                label="Executor",
+                role="executor",
+                repository=repository,
+                codex_home=root / "profile",
+                pipe=r"\\.\pipe\dual-codex-biel4-dead-aaaaaaaaaaaaaaaa",
+                pid=123,
+                started_at="now",
+                log_file=sessions / "biel4-dead.pty.log",
+            )
+            record = sessions / "biel4-dead.json"
+            record.write_text(json.dumps(session.as_dict()), encoding="utf-8")
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+
+            with patch(
+                "dual_codex.terminal._pipe_request",
+                return_value={"ok": True, "state": {"session_id": "biel4-dead", "alive": False}},
+            ):
+                self.assertEqual(manager.list(), [])
+            self.assertFalse(record.exists())
+
+            record.write_text(json.dumps(session.as_dict()), encoding="utf-8")
+            with patch(
+                "dual_codex.terminal._pipe_request",
+                side_effect=TerminalError("temporary pipe outage"),
+            ):
+                rows = manager.list()
+            self.assertEqual(rows[0]["state"], "unreachable")
+            self.assertTrue(record.exists())
+            record.unlink()
+
+            identity_record = sessions / "biel4-identity.json"
+            identity_raw = session.as_dict()
+            identity_raw["session_id"] = "biel4-identity"
+            identity_raw["pipe"] = r"\\.\pipe\dual-codex-biel4-identity-bbbbbbbbbbbbbbbb"
+            identity_record.write_text(json.dumps(identity_raw), encoding="utf-8")
+            with patch(
+                "dual_codex.terminal._pipe_request",
+                return_value={
+                    "ok": True,
+                    "state": {
+                        "session_id": "biel4-identity",
+                        "pipe": r"\\.\pipe\different",
+                        "host_pid": 999,
+                        "alive": True,
+                    },
+                },
+            ):
+                self.assertEqual(manager.list(), [])
+            self.assertFalse(identity_record.exists())
+
+    def test_persistent_ensure_reuses_same_session_without_restarting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            config = _config(root, repository)
+            sessions = config.runs_dir / "terminal-sessions"
+            sessions.mkdir(parents=True)
+            session = TerminalSession(
+                session_id="biel4-reuse",
+                account="biel4",
+                label="Executor",
+                role="executor",
+                repository=repository,
+                codex_home=root / "profile",
+                pipe=r"\\.\pipe\dual-codex-biel4-reuse-aaaaaaaaaaaaaaaa",
+                pid=123,
+                started_at="now",
+                log_file=sessions / "biel4-reuse.pty.log",
+            )
+            (sessions / "biel4-reuse.json").write_text(json.dumps(session.as_dict()), encoding="utf-8")
+            agent = AgentConfig(
+                codex_home=session.codex_home,
+                model="gpt-5.6-sol",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="biel4",
+                label="Executor",
+            )
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            manager.status = lambda _session_id: {"state": "running"}
+            manager.wait_until_ready = lambda _session_id, **_kwargs: {"state": "READY"}
+            manager.start = lambda **_kwargs: self.fail("persistent reuse must not start a replacement TUI")
+
+            first = manager.ensure(
+                session_id=session.session_id,
+                agent=agent,
+                role="executor",
+                repository=repository,
+                add_dirs=(),
+            )
+            second = manager.ensure(
+                session_id=session.session_id,
+                agent=agent,
+                role="executor",
+                repository=repository,
+                add_dirs=(),
+            )
+            self.assertEqual(first.session_id, second.session_id)
+            self.assertEqual(first.pid, second.pid)
 
     def test_start_sets_account_home_and_rejects_duplicate_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

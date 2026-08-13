@@ -203,6 +203,20 @@ class SchemaTests(unittest.TestCase):
             },
         }
         _validate(strict, schema)
+        with_target_configuration = json.loads(json.dumps(strict))
+        with_target_configuration["reuse_provenance"].update(
+            {
+                "target_model": "gpt-5.6-sol",
+                "target_reasoning": "high",
+                "model_provenance": "tui_readiness",
+                "reasoning_provenance": "unavailable",
+            }
+        )
+        _validate(with_target_configuration, schema)
+        invalid_target_configuration = json.loads(json.dumps(with_target_configuration))
+        invalid_target_configuration["reuse_provenance"]["model_provenance"] = "caller"
+        with self.assertRaises(AssertionError):
+            _validate(invalid_target_configuration, schema)
         malformed = json.loads(json.dumps(strict))
         del malformed["reuse_provenance"]["session_process_epoch"]
         with self.assertRaises(AssertionError):

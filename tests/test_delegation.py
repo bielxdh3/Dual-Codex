@@ -204,6 +204,7 @@ class DelegationTests(unittest.TestCase):
                 terminal.call_args.kwargs["session_id"],
                 session_id_for("executor", repository),
             )
+            self.assertTrue(terminal.call_args.kwargs["reuse_existing"])
 
     def test_legacy_adapter_keeps_schema_and_check_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -243,6 +244,55 @@ class DelegationTests(unittest.TestCase):
             report, error = _read_report(path)
             self.assertIsNone(report)
             self.assertIn("schema validation failed", error)
+
+    def test_report_validation_canonicalises_omitted_command_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "executor-report.json"
+            path.write_text(
+                json.dumps({
+                    "summary": "Read-only probe completed.",
+                    "files_changed": [],
+                    "tests": [],
+                    "remaining_issues": [],
+                }),
+                encoding="utf-8",
+            )
+            report, error = _read_report(path)
+            self.assertEqual(error, "")
+            self.assertIsNotNone(report)
+            self.assertEqual(report["commands_run"], [])
+
+    def test_report_validation_rejects_invalid_telemetry_and_missing_semantics(self) -> None:
+        cases = (
+            {
+                "summary": "done",
+                "files_changed": [],
+                "commands_run": "none",
+                "tests": [],
+                "remaining_issues": [],
+            },
+            {
+                "files_changed": [],
+                "commands_run": [],
+                "tests": [],
+                "remaining_issues": [],
+            },
+            {
+                "summary": "done",
+                "files_changed": [],
+                "commands_run": [],
+                "tests": [{"command": "pytest"}],
+                "remaining_issues": [],
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            for index, value in enumerate(cases):
+                with self.subTest(index=index):
+                    path = Path(temp) / f"invalid-{index}.json"
+                    path.write_text(json.dumps(value), encoding="utf-8")
+                    report, error = _read_report(path)
+                    self.assertIsNone(report)
+                    self.assertIn("schema validation failed", error)
 
     def test_valid_implement_uses_only_executor_and_writes_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -477,6 +527,40 @@ class DelegationTests(unittest.TestCase):
             result = json.loads(result_file.read_text(encoding="utf-8"))
             self.assertEqual(outcome.status, "failed")
             self.assertIn("did not apply any repository changes", result["error"])
+
+    def test_read_only_attestation_without_repository_change_is_completed(self) -> None:
+        report = {
+            "summary": "Read-only handshake completed: DUAL_CODEX_SKILL_ATTESTATION_OK",
+            "files_changed": [],
+            "commands_run": ["git status --short"],
+            "tests": [{"command": "strict reuse handshake", "status": "passed", "details": "transport response received"}],
+            "remaining_issues": [],
+        }
+        status, summary, error = _classify_executor_result(
+            report=report,
+            report_error="",
+            changed=["preexisting.txt"],
+            command_result=CommandResult(["codex"], 0, "", ""),
+            repository_unchanged=True,
+        )
+        self.assertEqual((status, summary, error), ("completed", report["summary"], ""))
+
+    def test_read_only_report_without_commands_uses_semantics_not_telemetry(self) -> None:
+        report = {
+            "summary": "Read-only probe completed.",
+            "files_changed": [],
+            "commands_run": [],
+            "tests": [],
+            "remaining_issues": [],
+        }
+        status, _, error = _classify_executor_result(
+            report=report,
+            report_error="",
+            changed=[],
+            command_result=CommandResult(["codex"], 0, "", ""),
+            repository_unchanged=True,
+        )
+        self.assertEqual((status, error), ("completed", ""))
 
     def test_request_validation_rejects_version_malformed_and_unknown_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

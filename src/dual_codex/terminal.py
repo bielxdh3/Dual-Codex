@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from contextlib import contextmanager
+from enum import Enum
 import hashlib
 import json
 import os
@@ -9,6 +11,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -27,6 +31,7 @@ TERMINAL_INPUT_MAX_BYTES = 8192
 TERMINAL_LIVE_READ_MAX_BYTES = 65536
 TERMINAL_SUBMIT_DELAY_SECONDS = 0.1
 TERMINAL_COMPOSER_ACK_TIMEOUT_SECONDS = 5.0
+TERMINAL_TERM = "xterm-256color"
 _COMPLETED_EVENTS = {"turn_completed", "turn_complete", "task_completed", "task_complete"}
 _ABORTED_EVENTS = {"turn_aborted", "task_aborted"}
 _TURN_START_EVENTS = {"task_started", "turn_started", "turn_start"}
@@ -52,6 +57,7 @@ class TuiReadinessDetector:
         r"(?P<directory>(?:~|[A-Za-z]:)[\\/](?:[^\r\n\u2502]*[^\s\r\n\u2502])?)"
         r"\s*(?:\u2502)?\s*$"
     )
+    _REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
     _COSMETIC = frozenset(
         {
             "Explain this codebase",
@@ -73,8 +79,9 @@ class TuiReadinessDetector:
         re.IGNORECASE,
     )
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_idle_prompt: bool = False) -> None:
         self.state = self.NOT_READY
+        self.allow_idle_prompt = allow_idle_prompt
         self.seen_update = False
         self.seen_trust = False
         self.seen_ready = False
@@ -82,6 +89,8 @@ class TuiReadinessDetector:
         self.seen_placeholder = False
         self.stable_samples = 0
         self.ready_evidence = ""
+        self.target_model = ""
+        self.target_reasoning = ""
         self._fingerprint: tuple[str, str, str] | None = None
         self._raw = ""
         self.sanitized_tail = ""
@@ -89,6 +98,13 @@ class TuiReadinessDetector:
     @staticmethod
     def sanitize(value: str) -> str:
         return _ANSI_SEQUENCE.sub("", value).replace("\r", "")
+
+    @classmethod
+    def _split_model_reasoning(cls, value: str) -> tuple[str, str]:
+        parts = str(value).strip().split()
+        if parts and parts[-1].casefold() in cls._REASONING_EFFORTS and len(parts) > 1:
+            return " ".join(parts[:-1]), parts[-1]
+        return " ".join(parts), ""
 
     def feed(self, chunk: str) -> str:
         self._raw = (self._raw + str(chunk))[-50000:]
@@ -117,6 +133,10 @@ class TuiReadinessDetector:
             model_match = directory_match = footer_match
             last_model = footer_match.start("model")
             last_directory = footer_match.start("directory")
+        if model_match is not None:
+            self.target_model, self.target_reasoning = self._split_model_reasoning(
+                model_match.group("model")
+            )
         last_working = text.rfind("Working (")
         last_error = text.rfind("Error:")
 
@@ -148,7 +168,13 @@ class TuiReadinessDetector:
                 or last_model < last_directory < last_prompt
             )
         )
-        if prompt_match is not None and normal_markers and last_prompt > last_working:
+        persistent_idle_prompt = (
+            self.allow_idle_prompt
+            and prompt_match is not None
+            and last_prompt > last_working
+            and last_loading < 0
+        )
+        if prompt_match is not None and (normal_markers or persistent_idle_prompt) and last_prompt > last_working:
             self.seen_model_ready = True
             fingerprint = (
                 model_match.group("model").strip() if model_match else "",
@@ -159,7 +185,11 @@ class TuiReadinessDetector:
             self._fingerprint = fingerprint
             if self.stable_samples >= 2:
                 self.seen_ready = True
-                self.ready_evidence = "stable Codex model/directory/composer markers"
+                self.ready_evidence = (
+                    "stable idle composer marker for verified persistent session"
+                    if self.allow_idle_prompt and persistent_idle_prompt
+                    else "stable Codex model/directory/composer markers"
+                )
                 self.state = self.READY
                 return self.state
         else:
@@ -178,6 +208,10 @@ class TuiReadinessDetector:
             "seen_placeholder": self.seen_placeholder,
             "stable_samples": self.stable_samples,
             "ready_evidence": self.ready_evidence,
+            "target_model": self.target_model or "unknown",
+            "target_reasoning": self.target_reasoning or "unknown",
+            "model_provenance": "tui_readiness" if self.target_model else "unavailable",
+            "reasoning_provenance": "tui_readiness" if self.target_reasoning else "unavailable",
             "tail": self.sanitized_tail[-4000:],
         }
 
@@ -343,6 +377,17 @@ def _process_start_identity(pid: int) -> str:
         return ""
 
 
+class TerminalLifecyclePolicy(str, Enum):
+    """Define who owns a terminal when an attempt-level probe fails."""
+
+    STARTUP = "startup"
+    PERSISTENT_REUSE = "persistent_reuse"
+
+    @property
+    def cleanup_on_failure(self) -> bool:
+        return self is self.STARTUP
+
+
 def validate_control_message(message: str, *, forbidden_text: str = "") -> str:
     if not isinstance(message, str) or not message.strip():
         raise TerminalError("Terminal control message must be non-empty text.")
@@ -390,6 +435,11 @@ class TerminalSession:
     baseline_rollout_mtimes: dict[str, float] = field(default_factory=dict)
     codex_session_id: str = ""
     task_artifact_dir: Path | None = None
+    viewer_pid: int = 0
+    viewer_started_at: float = 0.0
+    viewer_process_start_identity: str = ""
+    viewer_epoch: str = ""
+    visible_required: bool = False
 
     @classmethod
     def from_record(cls, raw: dict[str, Any]) -> "TerminalSession":
@@ -418,6 +468,11 @@ class TerminalSession:
             },
             codex_session_id=str(raw.get("codex_session_id", "")),
             task_artifact_dir=(Path(raw["task_artifact_dir"]) if raw.get("task_artifact_dir") else None),
+            viewer_pid=int(raw.get("viewer_pid", 0) or 0),
+            viewer_started_at=float(raw.get("viewer_started_at", 0.0) or 0.0),
+            viewer_process_start_identity=str(raw.get("viewer_process_start_identity", "")),
+            viewer_epoch=str(raw.get("viewer_epoch", "")),
+            visible_required=bool(raw.get("visible_required", False)),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -444,6 +499,11 @@ class TerminalSession:
             "baseline_rollout_mtimes": self.baseline_rollout_mtimes,
             "codex_session_id": self.codex_session_id,
             "task_artifact_dir": str(self.task_artifact_dir) if self.task_artifact_dir else "",
+            "viewer_pid": self.viewer_pid,
+            "viewer_started_at": self.viewer_started_at,
+            "viewer_process_start_identity": self.viewer_process_start_identity,
+            "viewer_epoch": self.viewer_epoch,
+            "visible_required": self.visible_required,
         }
 
 
@@ -499,7 +559,9 @@ def _helper_path(config: OrchestratorConfig) -> Path:
 
 def _terminal_environment(agent: AgentConfig) -> dict[str, str]:
     """Use the account profile, never an API key inherited from the orchestrator."""
-    return codex_environment(agent)
+    environment = codex_environment(agent)
+    environment["TERM"] = TERMINAL_TERM
+    return environment
 
 
 def _pipe_request(pipe: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -654,6 +716,27 @@ class TerminalManager:
         if os.name != "nt":
             raise TerminalError("The native ConPTY backend requires Windows.")
         self.config = config
+        self._input_leases: dict[str, threading.Lock] = {}
+        self._last_readiness_diagnostics: dict[str, Any] = {}
+
+    def _input_lease_lock(self, session_id: str) -> threading.Lock:
+        # The lease is attempt-owned and intentionally not persisted in the
+        # session record. A failed attempt must never make a live TUI appear
+        # permanently busy to the next attempt.
+        leases = getattr(self, "_input_leases", None)
+        if leases is None:
+            leases = self._input_leases = {}
+        return leases.setdefault(session_id, threading.Lock())
+
+    @contextmanager
+    def _input_lease(self, session_id: str):
+        lock = self._input_lease_lock(session_id)
+        if not lock.acquire(blocking=False):
+            raise TerminalError(f"Terminal session '{session_id}' is already busy.")
+        try:
+            yield
+        finally:
+            lock.release()
 
     def _load(self, session_id: str) -> TerminalSession:
         path = _record_path(self.config, session_id)
@@ -675,6 +758,25 @@ class TerminalManager:
             result = _pipe_request(session.pipe, {"op": "status"})
             state = result["state"]
             identity_match = True
+            try:
+                identity_match = (
+                    str(state.get("session_id", session.session_id)) == session.session_id
+                    and (not state.get("pipe") or str(state.get("pipe")) == session.pipe)
+                )
+            except (AttributeError, TypeError, ValueError):
+                identity_match = False
+            if state.get("host_pid") and int(getattr(session, "pid", 0) or 0):
+                try:
+                    identity_match &= int(state["host_pid"]) == int(session.pid)
+                except (TypeError, ValueError):
+                    identity_match = False
+            if state.get("host_started_at") and getattr(session, "process_started_at", 0.0):
+                try:
+                    identity_match &= abs(
+                        float(state["host_started_at"]) - float(session.process_started_at)
+                    ) <= 10.0
+                except (TypeError, ValueError):
+                    identity_match = False
             recorded_identity = session.process_start_identity
             actual_identity = str(state.get("process_start_identity", "")) or _process_start_identity(session.pid)
             if recorded_identity and actual_identity and recorded_identity != actual_identity:
@@ -683,10 +785,162 @@ class TerminalManager:
                 identity_match = False
             if session.process_epoch and state.get("process_epoch") and session.process_epoch != state.get("process_epoch"):
                 identity_match = False
-            lifecycle = "running" if state.get("alive") and identity_match else ("stale" if state.get("alive") else "exited")
+            lifecycle = "running" if state.get("alive") and identity_match else (
+                "identity_invalid" if state.get("alive") else "exited"
+            )
             return {**session.as_dict(), **state, "identity_match": identity_match, "state": lifecycle}
-        except TerminalError:
+        except (TerminalError, AttributeError, TypeError, ValueError):
             return {**session.as_dict(), "state": "unreachable"}
+
+    @staticmethod
+    def _visible_viewer_match(session: TerminalSession, status: dict[str, Any]) -> bool:
+        viewer = status.get("viewer")
+        if not isinstance(viewer, dict) or viewer.get("attached") is not True:
+            return False
+        try:
+            viewer_pid = int(viewer.get("pid") or 0)
+        except (TypeError, ValueError):
+            return False
+        if viewer_pid <= 0:
+            return False
+        expected_pid = int(getattr(session, "viewer_pid", 0) or 0)
+        if expected_pid and viewer_pid != expected_pid:
+            return False
+        expected_epoch = str(getattr(session, "viewer_epoch", "") or "")
+        if expected_epoch and str(viewer.get("viewer_epoch", "")) != expected_epoch:
+            return False
+        expected_identity = str(getattr(session, "viewer_process_start_identity", "") or "")
+        observed_identity = str(viewer.get("process_start_identity", "") or "")
+        if expected_identity and observed_identity != expected_identity:
+            return False
+        if observed_identity and os.name == "nt" and _process_start_identity(viewer_pid) != observed_identity:
+            return False
+        return True
+
+    def register_viewer(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        viewer_epoch: str,
+        viewer_pid: int | None = None,
+    ) -> dict[str, Any]:
+        owner = validate_lease_owner(owner)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,96}", str(viewer_epoch)):
+            raise TerminalError("Invalid terminal viewer epoch.")
+        pid = int(viewer_pid if viewer_pid is not None else os.getpid())
+        if pid < 1:
+            raise TerminalError("Invalid terminal viewer process.")
+        session = self._load(session_id)
+        return _pipe_request(
+            session.pipe,
+            {
+                "op": "register_viewer",
+                "owner": owner,
+                "viewer_pid": pid,
+                "viewer_epoch": str(viewer_epoch),
+                "process_start_identity": _process_start_identity(pid),
+            },
+        )
+
+    def unregister_viewer(self, session_id: str, owner: str, *, viewer_epoch: str = "") -> None:
+        owner = validate_lease_owner(owner)
+        session = self._load(session_id)
+        payload: dict[str, Any] = {"op": "unregister_viewer", "owner": owner}
+        if viewer_epoch:
+            payload["viewer_epoch"] = str(viewer_epoch)
+        try:
+            _pipe_request(session.pipe, payload)
+        except TerminalError:
+            pass
+
+    def _terminal_health(self, session: TerminalSession) -> str:
+        """Return only strong health evidence; transient pipe errors stay unknown."""
+
+        pipe = str(getattr(session, "pipe", "") or "")
+        if not pipe:
+            return "unknown"
+        try:
+            result = _pipe_request(pipe, {"op": "status"})
+            state = result.get("state")
+            if not isinstance(state, dict):
+                return "unknown"
+            session_id = str(getattr(session, "session_id", "") or "")
+            if session_id and str(state.get("session_id", session_id)) != session_id:
+                return "identity_invalid"
+            recorded_pipe = str(getattr(session, "pipe", "") or "")
+            if state.get("pipe") and str(state["pipe"]) != recorded_pipe:
+                return "identity_invalid"
+            recorded_host_pid = int(getattr(session, "pid", 0) or 0)
+            if state.get("host_pid") and recorded_host_pid and int(state["host_pid"]) != recorded_host_pid:
+                return "identity_invalid"
+            recorded_start = float(getattr(session, "process_started_at", 0.0) or 0.0)
+            observed_start = float(state.get("host_started_at", 0.0) or 0.0)
+            if recorded_start and observed_start and abs(recorded_start - observed_start) > 10.0:
+                return "identity_invalid"
+            if state.get("alive") is False:
+                return "dead"
+            if state.get("alive") is True:
+                return "alive"
+        except (TerminalError, AttributeError, TypeError, ValueError):
+            return "unknown"
+        return "unknown"
+
+    @staticmethod
+    def _find_codex_session_file(session: TerminalSession) -> tuple[Path, str] | None:
+        associated_session_id = str(getattr(session, "codex_session_id", "") or "")
+        if associated_session_id:
+            matches = [
+                record
+                for record in _rollout_records(session.codex_home, session.repository)
+                if record["codex_session_id"] == associated_session_id
+            ]
+            if matches:
+                selected = max(
+                    matches,
+                    key=lambda record: (str(record["timestamp"]), float(record["mtime"]), str(record["path"])),
+                )
+                return Path(selected["path"]), associated_session_id
+            return None
+        return find_session_file(session.codex_home, session.repository, after=time.time() - 30)
+
+    def _remove_record(self, session_id: str) -> None:
+        try:
+            _record_path(self.config, session_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _reconcile_after_attempt_failure(
+        self,
+        session: TerminalSession,
+        diagnostics: dict[str, Any],
+    ) -> str:
+        health = self._terminal_health(session)
+        diagnostics["terminal_health"] = health
+        if health in {"dead", "identity_invalid"}:
+            session_id = str(getattr(session, "session_id", "") or "")
+            if session_id:
+                self._remove_record(session_id)
+        return health
+
+    def _handle_attempt_failure(
+        self,
+        session: TerminalSession,
+        diagnostics: dict[str, Any],
+        lifecycle: TerminalLifecyclePolicy,
+        *,
+        session_id: str | None = None,
+    ) -> None:
+        if not isinstance(lifecycle, TerminalLifecyclePolicy):
+            lifecycle = TerminalLifecyclePolicy(str(lifecycle))
+        diagnostics["lifecycle_policy"] = lifecycle.value
+        target_id = session_id or str(getattr(session, "session_id", "") or "")
+        if not target_id:
+            return
+        if lifecycle.cleanup_on_failure:
+            self._stop_unready_session(target_id)
+        else:
+            self._reconcile_after_attempt_failure(session, diagnostics)
 
     @staticmethod
     def _codex_turn_activity(session: TerminalSession) -> dict[str, Any]:
@@ -757,9 +1011,20 @@ class TerminalManager:
             pass
         return updated
 
-    def wait_until_ready(self, session_id: str, *, timeout: float | None = None) -> dict[str, Any]:
+    def wait_until_ready(
+        self,
+        session_id: str,
+        *,
+        timeout: float | None = None,
+        lifecycle: TerminalLifecyclePolicy = TerminalLifecyclePolicy.PERSISTENT_REUSE,
+        require_visible: bool = False,
+    ) -> dict[str, Any]:
+        if not isinstance(lifecycle, TerminalLifecyclePolicy):
+            lifecycle = TerminalLifecyclePolicy(str(lifecycle))
         session = self._load(session_id)
-        detector = TuiReadinessDetector()
+        detector = TuiReadinessDetector(
+            allow_idle_prompt=lifecycle is TerminalLifecyclePolicy.PERSISTENT_REUSE
+        )
         limit = float(timeout if timeout is not None else self.config.terminal_readiness_timeout)
         started = time.monotonic()
         rollout_activity: dict[str, Any] = {"active": False, "source": "none"}
@@ -769,6 +1034,7 @@ class TerminalManager:
             except TerminalError as exc:
                 diagnostics = detector.diagnostics()
                 diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
                 self._write_readiness_diagnostics(session, diagnostics)
                 raise TerminalError(
                     f"Codex TUI exited before becoming ready for session '{session_id}': "
@@ -780,14 +1046,22 @@ class TerminalManager:
                 if rollout_activity["active"]:
                     time.sleep(0.25)
                     continue
+                if require_visible and not self._visible_viewer_match(session, self.status(session_id)):
+                    diagnostics = detector.diagnostics()
+                    diagnostics["visible_executor"] = "viewer_not_attached"
+                    time.sleep(0.25)
+                    continue
                 diagnostics = detector.diagnostics()
                 diagnostics["rollout_activity"] = rollout_activity
+                self._last_readiness_diagnostics = dict(diagnostics)
+                if require_visible:
+                    diagnostics["visible_executor"] = "viewer_attached_to_canonical_session"
                 return diagnostics
             if state == TuiReadinessDetector.SETUP_REQUIRED:
                 diagnostics = detector.diagnostics()
                 diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
                 self._write_readiness_diagnostics(session, diagnostics)
-                self._stop_unready_session(session_id)
                 raise TerminalError(
                     f"Codex TUI requires explicit repository trust/setup for session '{session_id}': "
                     f"{json.dumps(diagnostics, ensure_ascii=False)}"
@@ -795,8 +1069,8 @@ class TerminalManager:
             if state == TuiReadinessDetector.FAILED:
                 diagnostics = detector.diagnostics()
                 diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
                 self._write_readiness_diagnostics(session, diagnostics)
-                self._stop_unready_session(session_id)
                 raise TerminalError(
                     f"Codex TUI failed before becoming ready for session '{session_id}': "
                     f"{json.dumps(diagnostics, ensure_ascii=False)}"
@@ -809,8 +1083,10 @@ class TerminalManager:
         diagnostics["terminal_session_id"] = str(getattr(session, "session_id", session_id))
         diagnostics["terminal_pid"] = getattr(session, "pid", None)
         diagnostics["terminal_started_at"] = str(getattr(session, "started_at", ""))
+        if require_visible:
+            diagnostics["visible_executor"] = "viewer_not_attached"
+        self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
         self._write_readiness_diagnostics(session, diagnostics)
-        self._stop_unready_session(session_id)
         raise TerminalError(
             f"Timed out after {limit:.1f}s waiting for Codex TUI readiness for session '{session_id}': "
             f"{json.dumps(diagnostics, ensure_ascii=False)}"
@@ -841,6 +1117,7 @@ class TerminalManager:
                         "elapsed_seconds": round(time.monotonic() - started, 3),
                     }
                 )
+                self._reconcile_after_attempt_failure(session, diagnostics)
                 self._write_composer_ack_diagnostics(session, diagnostics)
                 raise TerminalError(
                     f"Codex TUI exited before composer acknowledgement for session '{session_id}': "
@@ -863,6 +1140,7 @@ class TerminalManager:
                 "elapsed_seconds": round(time.monotonic() - started, 3),
             }
         )
+        self._reconcile_after_attempt_failure(session, diagnostics)
         self._write_composer_ack_diagnostics(session, diagnostics)
         raise TerminalError(
             f"Timed out after {limit:.1f}s waiting for composer acknowledgement for session '{session_id}'; "
@@ -877,8 +1155,11 @@ class TerminalManager:
         baseline_output: str = "",
         submitted_at: float | None = None,
         timeout: float | None = None,
+        lifecycle: TerminalLifecyclePolicy = TerminalLifecyclePolicy.PERSISTENT_REUSE,
     ) -> dict[str, Any]:
         """Confirm one submitted prompt created a real Codex turn."""
+        if not isinstance(lifecycle, TerminalLifecyclePolicy):
+            lifecycle = TerminalLifecyclePolicy(str(lifecycle))
         session = self._load(session_id)
         detector = TuiTurnStartDetector(baseline_output)
         limit = float(timeout if timeout is not None else self.config.terminal_turn_start_timeout)
@@ -919,8 +1200,8 @@ class TerminalManager:
                         "elapsed_seconds": round(time.monotonic() - started, 3),
                     }
                 )
+                self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
                 self._write_turn_start_diagnostics(session, diagnostics)
-                self._stop_unready_session(session_id)
                 raise TerminalError(
                     f"Codex TUI exited before turn start for session '{session_id}': "
                     f"{json.dumps(diagnostics, ensure_ascii=False)}"
@@ -944,8 +1225,8 @@ class TerminalManager:
                 "elapsed_seconds": round(time.monotonic() - started, 3),
             }
         )
+        self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
         self._write_turn_start_diagnostics(session, diagnostics)
-        self._stop_unready_session(session_id)
         raise TerminalError(
             f"Timed out after {limit:.1f}s waiting for Codex turn start for session '{session_id}'; "
             f"the prompt was sent once and may remain in the composer: "
@@ -988,6 +1269,113 @@ class TerminalManager:
         except TerminalError:
             pass
 
+    def _launch_visible_viewer(self, session: TerminalSession, viewer_epoch: str | None = None) -> TerminalSession:
+        """Open a console frontend for the existing managed PTY; never start Codex here."""
+        if os.name != "nt":
+            raise TerminalError("Visible Executor attach requires Windows.")
+        epoch = str(viewer_epoch or uuid4().hex)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,96}", epoch):
+            raise TerminalError("Invalid terminal viewer epoch.")
+        attach_args = [
+            str(sys.executable),
+            "-m",
+            "dual_codex.cli",
+            "--config",
+            str(self.config.config_path.resolve()),
+            "terminal",
+            "attach",
+            session.session_id,
+            "--interactive",
+            "--viewer-epoch",
+            epoch,
+        ]
+        powershell = None
+        for name in ("powershell.exe", "pwsh.exe", "powershell", "pwsh"):
+            powershell = shutil.which(name)
+            if powershell:
+                break
+        if powershell:
+            def powershell_literal(value: str) -> str:
+                return "'" + value.replace("'", "''") + "'"
+
+            command = [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                "& " + " ".join(powershell_literal(item) for item in attach_args),
+            ]
+        else:
+            command = [
+                os.environ.get("ComSpec") or shutil.which("cmd.exe") or r"C:\Windows\System32\cmd.exe",
+                "/d",
+                "/s",
+                "/c",
+                subprocess.list2cmdline(attach_args),
+            ]
+        env = os.environ.copy()
+        for secret_name in ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"):
+            env.pop(secret_name, None)
+        source_root = self.config.project_root / "src"
+        if source_root.is_dir():
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = os.pathsep.join(
+                item for item in (str(source_root), existing_pythonpath) if item
+            )
+        flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        try:
+            viewer = subprocess.Popen(
+                command,
+                cwd=self.config.project_root,
+                env=env,
+                creationflags=flags,
+                close_fds=False,
+            )
+        except OSError as exc:
+            raise TerminalError(f"Could not open the visible Executor viewer: {exc}") from exc
+        updated = replace(
+            session,
+            viewer_pid=int(viewer.pid),
+            viewer_started_at=time.time(),
+            viewer_process_start_identity=_process_start_identity(int(viewer.pid)),
+            viewer_epoch=epoch,
+            visible_required=True,
+        )
+        for _ in range(40):
+            try:
+                status = self.status(session.session_id)
+            except TerminalError:
+                break
+            registered = status.get("viewer")
+            if isinstance(registered, dict) and registered.get("attached") is True:
+                if str(registered.get("viewer_epoch", "")) == epoch:
+                    try:
+                        registered_pid = int(registered.get("pid") or 0)
+                    except (TypeError, ValueError):
+                        registered_pid = 0
+                    if registered_pid > 0:
+                        updated = replace(
+                            updated,
+                            viewer_pid=registered_pid,
+                            viewer_process_start_identity=str(registered.get("process_start_identity", "") or ""),
+                        )
+                    break
+            poll = getattr(viewer, "poll", None)
+            if callable(poll) and poll() is not None:
+                break
+            time.sleep(0.05)
+        try:
+            atomic_write_json(_record_path(self.config, session.session_id), updated.as_dict())
+        except OSError:
+            pass
+        return updated
+
+    def _ensure_visible_viewer(self, session: TerminalSession) -> TerminalSession:
+        status = self.status(session.session_id)
+        if self._visible_viewer_match(session, status):
+            return session
+        return self._launch_visible_viewer(session)
+
     def start(
         self,
         *,
@@ -997,6 +1385,7 @@ class TerminalManager:
         repository: Path,
         approval_policy: str = "on-request",
         add_dirs: tuple[Path, ...] = (),
+        visible: bool = False,
     ) -> TerminalSession:
         if agent.backend != "windows":
             raise TerminalError(f"Backend '{agent.backend}' is not implemented by the native terminal host.")
@@ -1042,7 +1431,6 @@ class TerminalManager:
         if resolved_add_dirs:
             command.extend(["--add-dir", str(resolved_add_dirs[0])])
         env = _terminal_environment(agent)
-        process_started_at = time.time()
         baseline_rollout_mtimes = _rollout_snapshot(agent.codex_home, repository)
         flags = 0
         if os.name == "nt":
@@ -1052,6 +1440,7 @@ class TerminalManager:
                 command, cwd=repository, env=env, stdin=subprocess.DEVNULL,
                 stdout=log, stderr=log, creationflags=flags, close_fds=os.name != "nt",
             )
+        process_started_at = time.time()
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             try:
@@ -1075,9 +1464,27 @@ class TerminalManager:
             codex_home_identity=path_identity_key(agent.codex_home),
             baseline_rollout_mtimes=baseline_rollout_mtimes,
             task_artifact_dir=task_artifact_dir,
+            visible_required=bool(visible),
         )
         atomic_write_json(record_path, session.as_dict())
-        self.wait_until_ready(session_id)
+        if visible:
+            session = self._launch_visible_viewer(session)
+        try:
+            self.wait_until_ready(
+                session_id,
+                lifecycle=TerminalLifecyclePolicy.STARTUP,
+                require_visible=bool(visible),
+            )
+        except TerminalError:
+            # Startup owns the newly spawned host. Preserve the explicit
+            # cleanup boundary even when the readiness probe itself failed.
+            if process.poll() is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+            self._remove_record(session_id)
+            raise
         ready = replace(session, state="ready")
         try:
             atomic_write_json(record_path, ready.as_dict())
@@ -1087,6 +1494,7 @@ class TerminalManager:
 
     def ensure(self, **kwargs: Any) -> TerminalSession:
         reuse_existing = bool(kwargs.pop("reuse_existing", False))
+        visible = bool(kwargs.pop("visible", False))
         if reuse_existing:
             return self.reuse_existing(**kwargs)
         session_id = str(kwargs["session_id"])
@@ -1099,9 +1507,18 @@ class TerminalManager:
                     raise TerminalError(
                         f"Existing terminal session '{session_id}' was not started with the required task transport directory."
                     )
-                self.wait_until_ready(session_id)
+                session = self._load(session_id)
+                if visible:
+                    session = self._ensure_visible_viewer(session)
+                self.wait_until_ready(
+                    session_id,
+                    lifecycle=TerminalLifecyclePolicy.PERSISTENT_REUSE,
+                    require_visible=visible,
+                )
                 return self._load(session_id)
-        return self.start(**kwargs)
+            if current.get("state") in {"exited", "identity_invalid"}:
+                self._remove_record(session_id)
+        return self.start(visible=visible, **kwargs)
 
     def reuse_existing(
         self,
@@ -1158,10 +1575,14 @@ class TerminalManager:
             raise TerminalError("Strict reuse-existing refused: terminal host PID mismatch.")
         if not session.process_epoch or status.get("process_epoch") != session.process_epoch:
             raise TerminalError("Strict reuse-existing refused: terminal process epoch mismatch.")
+        if not self._visible_viewer_match(session, status):
+            raise TerminalError(
+                "Strict reuse-existing refused: visible interactive Executor viewer is not attached to the canonical session."
+            )
         lease = status.get("input_lease")
         if isinstance(lease, dict) and lease.get("active"):
             raise TerminalError("Strict reuse-existing refused: terminal input is busy.")
-        self.wait_until_ready(session_id)
+        self.wait_until_ready(session_id, require_visible=True)
         activity = self._codex_turn_activity(session)
         if activity.get("active"):
             raise TerminalError("Strict reuse-existing refused: terminal session is busy with a Codex turn.")
@@ -1169,6 +1590,17 @@ class TerminalManager:
 
     def send(self, session_id: str, message: str, *, lease_owner: str = "") -> dict[str, Any]:
         session = self._load(session_id)
+        with self._input_lease(session_id):
+            return self._send_with_lease(session_id, session, message, lease_owner=lease_owner)
+
+    def _send_with_lease(
+        self,
+        session_id: str,
+        session: TerminalSession,
+        message: str,
+        *,
+        lease_owner: str = "",
+    ) -> dict[str, Any]:
         self.wait_until_ready(session_id)
         transport_metadata: dict[str, Any] = {}
         if not isinstance(message, str) or not message.strip():
@@ -1270,6 +1702,7 @@ class TerminalManager:
         *,
         mode: str = "automation",
         ttl_seconds: float = 900.0,
+        owner_pid: int | None = None,
     ) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         if mode not in {"automation", "human"}:
@@ -1278,23 +1711,43 @@ class TerminalManager:
         if ttl <= 0 or ttl > 3600:
             raise TerminalError("Terminal input lease TTL is outside the safe range.")
         session = self._load(session_id)
-        return _pipe_request(
-            session.pipe,
-            {"op": "acquire_input_lease", "owner": owner, "mode": mode, "ttl_ms": int(ttl * 1000)},
-        )
+        request: dict[str, Any] = {
+            "op": "acquire_input_lease",
+            "owner": owner,
+            "mode": mode,
+            "ttl_ms": int(ttl * 1000),
+        }
+        if owner_pid is not None:
+            if isinstance(owner_pid, bool) or not isinstance(owner_pid, int) or owner_pid < 1:
+                raise TerminalError("Terminal input lease owner process is invalid.")
+            request["owner_pid"] = owner_pid
+        return _pipe_request(session.pipe, request)
 
-    def renew_input_lease(self, session_id: str, owner: str, *, ttl_seconds: float = 900.0) -> dict[str, Any]:
+    def renew_input_lease(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        ttl_seconds: float = 900.0,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         ttl = float(ttl_seconds)
         if ttl <= 0 or ttl > 3600:
             raise TerminalError("Terminal input lease TTL is outside the safe range.")
         session = self._load(session_id)
-        return _pipe_request(session.pipe, {"op": "renew_input_lease", "owner": owner, "ttl_ms": int(ttl * 1000)})
+        request: dict[str, Any] = {"op": "renew_input_lease", "owner": owner, "ttl_ms": int(ttl * 1000)}
+        if generation is not None:
+            request["generation"] = generation
+        return _pipe_request(session.pipe, request)
 
-    def release_input_lease(self, session_id: str, owner: str) -> dict[str, Any]:
+    def release_input_lease(self, session_id: str, owner: str, *, generation: int | None = None) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         session = self._load(session_id)
-        return _pipe_request(session.pipe, {"op": "release_input_lease", "owner": owner})
+        request: dict[str, Any] = {"op": "release_input_lease", "owner": owner}
+        if generation is not None:
+            request["generation"] = generation
+        return _pipe_request(session.pipe, request)
 
     def begin_automation_turn(self, session_id: str, owner: str = "") -> str:
         owner = validate_lease_owner(owner or f"automation:{uuid4().hex[:16]}")
@@ -1330,14 +1783,27 @@ class TerminalManager:
     def live_cursor(self, session_id: str) -> int:
         return int(self.read_since(session_id, 0, max_bytes=1).get("next_seq", 0))
 
-    def write_input(self, session_id: str, data: str, owner: str) -> dict[str, Any]:
+    def write_input(
+        self,
+        session_id: str,
+        data: str,
+        owner: str,
+        *,
+        generation: int | None = None,
+        auto_lease: bool = False,
+    ) -> dict[str, Any]:
         owner = validate_lease_owner(owner)
         if not isinstance(data, str) or not data or len(data.encode("utf-8")) > TERMINAL_INPUT_MAX_BYTES:
             raise TerminalError("Raw terminal input is empty or exceeds the safe limit.")
         if "\x00" in data:
             raise TerminalError("Raw terminal input contains NUL.")
         session = self._load(session_id)
-        return _pipe_request(session.pipe, {"op": "write_input", "owner": owner, "data": data})
+        request: dict[str, Any] = {"op": "write_input", "owner": owner, "data": data}
+        if generation is not None:
+            request["generation"] = generation
+        if auto_lease:
+            request.update({"auto_lease": True, "mode": "human", "owner_pid": os.getpid()})
+        return _pipe_request(session.pipe, request)
 
     def resize(self, session_id: str, columns: int, rows: int) -> dict[str, Any]:
         if (
@@ -1363,9 +1829,18 @@ class TerminalManager:
         if status.get("state") != "running":
             raise TerminalError(f"Cannot attach to terminal session in state {status.get('state')}.")
         owner = validate_lease_owner(f"human:{uuid4().hex[:16]}")
+        generation: int | None = None
         viewer_only = False
         try:
-            self.acquire_input_lease(session_id, owner, mode="human", ttl_seconds=3600)
+            result = self.acquire_input_lease(
+                session_id,
+                owner,
+                mode="human",
+                ttl_seconds=3600,
+                owner_pid=os.getpid(),
+            )
+            lease = result.get("input_lease") if isinstance(result, dict) else None
+            generation = lease.get("generation") if isinstance(lease, dict) else None
         except TerminalError as exc:
             if "busy" not in str(exc).casefold() and "lease" not in str(exc).casefold():
                 raise
@@ -1373,25 +1848,47 @@ class TerminalManager:
         return {
             "session": session,
             "owner": owner,
+            "generation": generation if isinstance(generation, int) else None,
             "viewer_only": viewer_only,
             "poll_seconds": max(0.02, min(float(poll_seconds), 1.0)),
         }
 
-    def detach_interactive(self, session_id: str, owner: str) -> None:
+    def detach_interactive(self, session_id: str, owner: str, *, generation: int | None = None) -> None:
         try:
-            self.release_input_lease(session_id, owner)
+            self.release_input_lease(session_id, owner, generation=generation)
         except TerminalError:
             pass
 
+    def release_completed_human_command(
+        self,
+        session_id: str,
+        owner: str,
+        *,
+        generation: int | None = None,
+        turn_seen: bool = False,
+    ) -> bool:
+        """Release a human lease only after its submitted Codex turn completed."""
+        if not turn_seen:
+            return False
+        status = self.status(session_id)
+        lease = status.get("input_lease")
+        if not isinstance(lease, dict) or not lease.get("active"):
+            return False
+        if lease.get("owner") != owner or lease.get("mode") != "human":
+            return False
+        if lease.get("composition_active") or lease.get("configuration_pending"):
+            return False
+        if lease.get("reason") != "human_command_submitted":
+            return False
+        session = self._load(session_id)
+        if self._codex_turn_activity(session).get("active"):
+            return False
+        self.release_input_lease(session_id, owner, generation=generation)
+        return True
+
     def turn_cursor(self, session_id: str) -> tuple[Path | None, int]:
         session = self._load(session_id)
-        codex_session_id = str(getattr(session, "codex_session_id", "") or "")
-        discovered = find_session_file(
-            session.codex_home,
-            session.repository,
-            after=0.0 if codex_session_id else time.time() - 30,
-            codex_session_id=codex_session_id,
-        )
+        discovered = self._find_codex_session_file(session)
         if not discovered:
             return None, 0
         path, _ = discovered
@@ -1412,12 +1909,7 @@ class TerminalManager:
         expected_codex_session_id = str(getattr(session, "codex_session_id", "") or "")
 
         def discover() -> tuple[Path, str] | None:
-            return find_session_file(
-                session.codex_home,
-                session.repository,
-                after=0.0 if expected_codex_session_id else time.time() - 30,
-                codex_session_id=expected_codex_session_id,
-            )
+            return self._find_codex_session_file(session)
 
         cursor_path, cursor_offset = cursor or (None, 0)
         discovered = discover()
@@ -1464,7 +1956,11 @@ class TerminalManager:
         for path in sorted(directory.glob("*.json")):
             try:
                 session = TerminalSession.from_record(json.loads(path.read_text(encoding="utf-8")))
-                rows.append(self.status(session.session_id))
+                row = self.status(session.session_id)
+                if row.get("state") in {"exited", "identity_invalid"}:
+                    self._remove_record(session.session_id)
+                    continue
+                rows.append(row)
             except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue
         return rows

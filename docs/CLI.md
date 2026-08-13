@@ -102,6 +102,7 @@ do MCP `codex_apps` do Desktop.
 ```text
 dual-codex terminal start architect-account --role architect --attach
 dual-codex terminal start executor-account --role executor --attach
+dual-codex terminal start executor-account --role executor --headless
 dual-codex terminal list --json
 dual-codex terminal send <session-id> "mensagem de follow-up"
 dual-codex terminal attach <session-id>
@@ -111,7 +112,17 @@ dual-codex terminal terminate <session-id>
 O modo `dual-codex terminal attach <session-id> --interactive` usa o ConPTY
 registrado, saida live por cursor e encaminhamento raw de teclas. `Ctrl-]`
 desanexa sem terminar a sessao; quando a automacao possui o lease de entrada,
-o humano fica viewer-only. O attach padrao permanece o snapshot legado.
+o humano fica viewer-only. Composicao humana permanece protegida; depois de
+inatividade o lease pode expirar e ser readquirido atomicamente na proxima
+tecla. Comandos `/model` e `/reasoning` liberam o lease quando o prompt ocioso
+volta. O attach padrao permanece o snapshot legado.
+
+Ao iniciar um `executor`, Dual Codex abre automaticamente uma janela visivel
+com `terminal attach --interactive` ligada ao mesmo host ConPTY. Esse cliente
+nao cria outro processo Codex; `terminal list --json` exibe o host PID, processo
+Executor, viewer PID, epoch e named pipe. `--headless` desativa a janela para
+fluxos que nao exigem interacao humana. `--reuse-existing` exige esse viewer e
+as identidades correspondentes de sessao, conta, `CODEX_HOME` e repositorio.
 
 Para exigir a reutilizacao exata, sem start ou fallback silencioso:
 
@@ -120,9 +131,18 @@ dual-codex delegate --request-file request.json --result-file result.json --reus
 ```
 
 Essa opcao exige o `executor` nativo Windows registrado e pronto, com a mesma
-conta, `CODEX_HOME`, repositorio, role e identidade host/PID/epoch. Ausencia,
+conta, `CODEX_HOME`, repositorio, role, viewer e identidade host/PID/epoch. Ausencia,
 stale, busy ou pipe inalcançavel falham fechado. Uma TUI aberta externamente
 nao pode ser adotada.
+
+No resultado, `commands_run: []` significa apenas que o executor nao forneceu
+telemetria de comandos; nao e uma falha. Os campos semanticos continuam
+obrigatorios e valores presentes com tipo invalido falham na validacao. Em
+`reuse_provenance`, conta, role, repositorio, `CODEX_HOME`, sessao, pipe, viewer
+e os campos `target_model`/`target_reasoning` sao evidencias do wrapper/TUI;
+texto produzido pelo modelo nao pode substitui-los. Modelo ou raciocinio que
+nao possam ser observados com seguranca aparecem como `unknown`, com
+proveniencia `unavailable`.
 
 `--attach` mantém a saída do TUI visível no terminal atual. O comando
 `delegate` usa a sessão persistente do executor por conta e repositório,

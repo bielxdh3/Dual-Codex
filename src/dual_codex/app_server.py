@@ -14,7 +14,11 @@ from typing import Any, Callable
 from .config import AgentConfig, OrchestratorConfig
 from .live_events import LiveEventJournal
 from .process import CommandResult, _prepare_command, codex_environment
-from .report import atomic_write_json
+from .report import (
+    atomic_write_json,
+    is_executor_report_shape,
+    normalise_executor_report,
+)
 
 
 class AppServerError(RuntimeError):
@@ -47,15 +51,26 @@ def _normalise_report(message: str) -> str:
     value = _report_object(message)
     if value is None:
         return message
-    required = ("summary", "files_changed", "commands_run", "tests", "remaining_issues")
-    if all(name in value for name in required) and isinstance(value.get("tests"), list):
-        return json.dumps({name: value[name] for name in required}, ensure_ascii=False)
+    canonical = normalise_executor_report(value)
+    if is_executor_report_shape(canonical):
+        return json.dumps(canonical, ensure_ascii=False)
     tests = value.get("tests")
     if not (
         isinstance(tests, dict)
         or "status" in value
         or "commit_created" in value
         or "dependencies_added" in value
+    ):
+        return message
+    if any(
+        name in value and not isinstance(value[name], list)
+        for name in ("files_changed", "commands_run", "remaining_issues")
+    ):
+        return message
+    if (
+        not isinstance(value.get("summary"), str)
+        or not isinstance(value.get("files_changed"), list)
+        or not isinstance(value.get("remaining_issues"), list)
     ):
         return message
     normalised_tests: list[dict[str, str]] = []
@@ -67,20 +82,19 @@ def _normalise_report(message: str) -> str:
         normalised_tests.append({"command": command, "status": status, "details": details})
     elif isinstance(tests, list):
         for item in tests:
-            if isinstance(item, dict):
-                normalised_tests.append(
-                    {
-                        "command": str(item.get("command", "")),
-                        "status": str(item.get("status", "not_run")),
-                        "details": str(item.get("details", "")),
-                    }
-                )
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"command", "status", "details"}
+                or not all(isinstance(item[field], str) for field in ("command", "status", "details"))
+            ):
+                return message
+            normalised_tests.append(dict(item))
     normalised = {
-        "summary": str(value.get("summary") or "Executor completed."),
-        "files_changed": value.get("files_changed") if isinstance(value.get("files_changed"), list) else [],
-        "commands_run": value.get("commands_run") if isinstance(value.get("commands_run"), list) else [],
+        "summary": value["summary"],
+        "files_changed": value["files_changed"],
+        "commands_run": value.get("commands_run", []),
         "tests": normalised_tests,
-        "remaining_issues": value.get("remaining_issues") if isinstance(value.get("remaining_issues"), list) else [],
+        "remaining_issues": value["remaining_issues"],
     }
     return json.dumps(normalised, ensure_ascii=False)
 

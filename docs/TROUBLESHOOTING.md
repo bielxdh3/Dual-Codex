@@ -48,12 +48,26 @@ Use `terminal attach <session-id>` para um snapshot seguro. `--interactive`
 exige um registro Dual Codex nativo valido e nao cria um segundo Codex;
 `Ctrl-]` faz detach sem apagar o registro. Durante `delegate`, o lease de
 entrada e exclusivo da automacao, portanto o humano anexado fica watch-only.
+Ao iniciar um executor, a janela visivel e criada automaticamente como esse
+viewer do mesmo ConPTY; `--headless` e a excecao explicita para fluxos sem TUI.
 
 ## `--reuse-existing` falha fechado
 
-Essa opcao exige sessao Windows registrada do `executor`, com host/PID e epoch
-validos, named pipe alcancavel, readiness confirmada, sem turno ou lease
+Essa opcao exige sessao Windows registrada do `executor`, com host/PID, viewer
+e epoch validos, named pipe alcancavel, readiness confirmada, sem turno ou lease
 concorrente e com a mesma conta, `CODEX_HOME` e identidade do repositorio.
-Corrija a sessao registrada ou use o fluxo normal reuse/start quando iniciar
-uma nova sessao for aceitavel. Uma TUI aberta fora do Dual Codex nao pode ser
-adotada por nao possuir proveniencia verificavel.
+Uma anexacao humana ociosa libera o lease apos uma pequena janela de inatividade;
+composicao real continua protegida, e comandos `/model` e `/reasoning` liberam o
+lease quando o prompt ocioso volta. O attach readquire o mesmo lease de forma
+atomica quando o usuario volta a digitar. Corrija a sessao registrada ou use o
+fluxo normal reuse/start quando iniciar uma nova sessao for aceitavel. Uma TUI
+aberta fora do Dual Codex nao pode ser adotada por nao possuir proveniencia
+verificavel.
+
+## Relatorio estruturado rejeitado
+
+`commands_run` e telemetria opcional: quando omitido, o wrapper canoniza o
+campo para `[]`. `summary`, `files_changed`, `tests` e `remaining_issues` nao
+sao preenchidos por heuristica; ausencia, tipo invalido ou teste malformado
+continua sendo erro de schema. A identidade em `reuse_provenance` vem do
+registro/host/pipe/viewer verificados, nunca do auto-relato do modelo.
