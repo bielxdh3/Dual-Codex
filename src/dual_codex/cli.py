@@ -16,6 +16,8 @@ from .doctor import run_doctor
 from .git import ensure_git_repository, status_porcelain
 from .orchestrator import execute
 from .process import run_command
+from .publication import PublicationError, execute_publication, publication_request_from_json
+from .report import atomic_write_json
 from .terminal import TerminalError, TerminalManager, session_id_for
 from .registry import (
     abbreviate_path,
@@ -197,6 +199,13 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Require and reuse the exact registered live native Executor TUI; never start or fall back",
     )
+
+    publication = sub.add_parser(
+        "publish",
+        help="Run one typed host-side publication operation with secure host credentials",
+    )
+    publication.add_argument("--request-file", required=True, help="Typed non-secret publication request JSON")
+    publication.add_argument("--result-file", required=True, help="Atomic JSON result path")
 
     terminal = sub.add_parser("terminal", help="Manage native Windows Codex terminal sessions")
     terminal_sub = terminal.add_subparsers(dest="terminal_command", required=True)
@@ -683,6 +692,26 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             return 0 if outcome.status == "completed" else 1
+        if args.command == "publish":
+            result_path = Path(args.result_file)
+            try:
+                raw_request = json.loads(Path(args.request_file).read_text(encoding="utf-8-sig"))
+                request = publication_request_from_json(raw_request)
+                result = execute_publication(request)
+                atomic_write_json(result_path, result.as_dict())
+            except (OSError, UnicodeError, json.JSONDecodeError, PublicationError) as exc:
+                payload = {
+                    "status": "blocked",
+                    "operation": "unknown",
+                    "mission_id": "",
+                    "error_classification": getattr(exc, "classification", "MALFORMED_PUBLICATION_REQUEST"),
+                    "detail": getattr(exc, "detail", "Publication request could not be processed."),
+                }
+                atomic_write_json(result_path, payload)
+                print("DUAL_CODEX_PUBLICATION_RESULT " + json.dumps(payload, ensure_ascii=False), flush=True)
+                return 1
+            print("DUAL_CODEX_PUBLICATION_RESULT " + json.dumps(result.as_dict(), ensure_ascii=False), flush=True)
+            return 0 if result.status == "completed" else 1
         if args.command == "account":
             _account_command(args, config)
             return 0

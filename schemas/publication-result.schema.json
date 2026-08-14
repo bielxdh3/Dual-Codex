@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "operation", "mission_id", "error_classification", "detail"],
+  "properties": {
+    "status": {"type": "string", "enum": ["completed", "blocked"]},
+    "operation": {"type": "string", "enum": ["normal_push", "draft_pr_create", "draft_pr_update", "unknown"]},
+    "repository": {"type": "string"},
+    "repository_full_name": {"type": "string"},
+    "mission_id": {"type": "string"},
+    "branch": {"type": "string"},
+    "pr_number": {"type": ["integer", "null"]},
+    "expected_remote_old_sha": {"type": "string"},
+    "observed_remote_old_sha": {"type": "string"},
+    "requested_new_sha": {"type": "string"},
+    "observed_remote_new_sha": {"type": "string"},
+    "fast_forward": {"type": "boolean"},
+    "remote_state": {"type": "string"},
+    "error_classification": {"type": "string"},
+    "detail": {"type": "string"}
+  }
+}

@@ -67,6 +67,12 @@ acoes listadas em `authorization.allowed_actions` podem ser solicitadas.
 Autorizacao para `normal_push` nao inclui `force_push`, e autorizacao para
 Draft PR nao inclui merge, release, tag ou deploy.
 
+Operacoes autenticadas de GitHub nao sao executadas dentro do sandbox do
+Executor. O control plane pode encaminhar uma solicitacao tipada ao broker
+host-side (`dual-codex publish`), que reutiliza essa mesma allow-list,
+verifica o repositorio e aplica o CAS de SHA remoto sem transportar tokens,
+headers ou credential-store data para o Executor.
+
 ## Dois terminais
 
 Para deixar as duas contas visiveis, abra duas janelas nativas e execute:

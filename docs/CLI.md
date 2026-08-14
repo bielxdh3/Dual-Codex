@@ -37,6 +37,8 @@ sanitizados no diretorio da execucao.
 - [delegation-request.schema.json](../schemas/delegation-request.schema.json)
 - [delegation-result.schema.json](../schemas/delegation-result.schema.json)
 - [delegation-report.schema.json](../schemas/delegation-report.schema.json)
+- [publication-request.schema.json](../schemas/publication-request.schema.json)
+- [publication-result.schema.json](../schemas/publication-result.schema.json)
 
 Um pedido `implement` contem `schema_version: 1`, `request_id`, `action`,
 `repository` e `task`. `authorization`, `constraints`, `context_files` e
@@ -56,9 +58,20 @@ dual-codex status [--json]
 dual-codex dashboard [--port PORT] [--no-open]
 dual-codex doctor
 dual-codex run task.md
+dual-codex publish --request-file publication.json --result-file publication-result.json
 dual-codex account ...
 dual-codex role ...
 ```
+
+`publish` e o broker local de host para operacoes tipadas de publicacao. Ele
+aceita somente `normal_push`, `draft_pr_create` ou `draft_pr_update`, valida a
+allow-list de autorizacao existente, a identidade do repositorio e a
+autenticacao GitHub do host, e nunca recebe tokens. O push usa Git OpenSSL com
+verificacao de certificados, exige SHA remoto esperado, descendencia
+fast-forward e revalida o SHA depois da operacao. O comando nao aceita shell,
+force-push, merge, release, tag, deploy ou mutacao destrutiva. O App Server nao
+recebe acesso ao credential store; o broker deve ser chamado pelo control
+plane confiavel no contexto normal do host.
 
 `dual-codex dashboard` serve uma interface local em `127.0.0.1` (porta livre
 por padrão) e abre o navegador, salvo com `--no-open`. O painel usa chamadas
