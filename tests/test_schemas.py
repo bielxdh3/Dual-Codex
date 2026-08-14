@@ -146,6 +146,37 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _validate(request, schema)
 
+    def test_delegation_request_authorization_allow_list(self) -> None:
+        schema = json.loads(
+            (SCHEMA_ROOT / "delegation-request.schema.json").read_text(encoding="utf-8")
+        )
+        base = {
+            "schema_version": 1,
+            "request_id": "request-1",
+            "action": "implement",
+            "repository": "C:/Projects/example",
+            "task": "Apply the requested change.",
+        }
+        _validate(
+            {
+                **base,
+                "authorization": {
+                    "allowed_actions": ["local_mutation", "local_commit", "normal_push"]
+                },
+            },
+            schema,
+        )
+        with self.assertRaises(AssertionError):
+            _validate(
+                {**base, "authorization": {"allowed_actions": ["force_everything"]}},
+                schema,
+            )
+        with self.assertRaises(AssertionError):
+            _validate(
+                {**base, "authorization": {"unexpected": []}},
+                schema,
+            )
+
     def test_delegation_result_strict_reuse_discriminator(self) -> None:
         schema = json.loads(
             (SCHEMA_ROOT / "delegation-result.schema.json").read_text(encoding="utf-8")

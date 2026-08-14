@@ -32,12 +32,17 @@ executor estiver sem role ou sem login.
   "action": "implement",
   "repository": "C:/Projects/Target",
   "task": "# Implementacao\n...",
-  "constraints": ["Do not commit", "Do not edit unrelated files"],
+  "constraints": ["Do not edit unrelated files"],
+  "authorization": {"allowed_actions": []},
   "context_files": [],
   "review_findings": [],
   "max_correction_cycles": 0
 }
 ```
+
+Para uma missao explicitamente autorizada, substitua a lista vazia pelas
+acoes exatas, por exemplo `local_commit`, `normal_push`, `draft_pr_create` e
+`draft_pr_update`; nao inclua capacidades nao necessarias.
 
 O pedido `correct` reutiliza o texto original da tarefa e inclui, por exemplo:
 
@@ -56,8 +61,11 @@ O pedido `correct` reutiliza o texto original da tarefa e inclui, por exemplo:
 ```
 
 O App nunca deve chamar novamente seu proprio perfil visivel por `codex exec`,
-ler `auth.json`, afirmar sucesso sem ler o diff, ou solicitar commit, push,
-PR, merge ou release.
+ler `auth.json`, ou afirmar sucesso sem ler o diff. Publicacao permanece
+negada por padrao; quando o pedido inclui autorizacao explicita, somente as
+acoes listadas em `authorization.allowed_actions` podem ser solicitadas.
+Autorizacao para `normal_push` nao inclui `force_push`, e autorizacao para
+Draft PR nao inclui merge, release, tag ou deploy.
 
 ## Dois terminais
 

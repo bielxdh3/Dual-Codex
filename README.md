@@ -10,8 +10,10 @@ Task → Architect plan → Executor implementation → Reviewer
                                   └── correction ───┘
 ```
 
-O projeto nao faz commit, push, PR ou merge. Os artefatos ficam em `runs/` e o
-repositorio pode exigir estado limpo por configuracao.
+Por padrao, o projeto nao faz commit, push, PR ou merge. Uma delegacao pode
+autorizar acoes especificas por missao em `authorization.allowed_actions`; os
+artefatos ficam em `runs/` e o repositorio pode exigir estado limpo por
+configuracao.
 
 ## Account profile != Role
 

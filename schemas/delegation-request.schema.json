@@ -24,6 +24,36 @@
       }
     },
     "max_correction_cycles": {"type": "integer", "minimum": 0},
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowed_actions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "local_mutation",
+              "local_commit",
+              "normal_push",
+              "branch_publication",
+              "draft_pr_create",
+              "draft_pr_update",
+              "ready_for_review",
+              "merge",
+              "tag",
+              "release",
+              "deploy",
+              "force_push",
+              "destructive_remote",
+              "issue_state",
+              "repository_settings"
+            ]
+          }
+        }
+      }
+    },
     "parent_request_id": {"type": "string", "minLength": 1}
   }
 }

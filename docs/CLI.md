@@ -39,8 +39,10 @@ sanitizados no diretorio da execucao.
 - [delegation-report.schema.json](../schemas/delegation-report.schema.json)
 
 Um pedido `implement` contem `schema_version: 1`, `request_id`, `action`,
-`repository` e `task`. `constraints`, `context_files` e
-`max_correction_cycles` sao opcionais. Um pedido `correct` tambem exige
+`repository` e `task`. `authorization`, `constraints`, `context_files` e
+`max_correction_cycles` sao opcionais. `authorization.allowed_actions` e uma
+allow-list explicita e fechada, com negacao por padrao; cada acao deve ser
+autorizada separadamente. Um pedido `correct` tambem exige
 `parent_request_id` e uma lista de findings com `title` e `details`.
 
 O resultado pode ter `completed`, `failed`, `invalid_request`,
