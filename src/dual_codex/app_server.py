@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 from .config import AgentConfig, OrchestratorConfig
 from .live_events import LiveEventJournal
-from .process import CommandResult, _prepare_command, codex_environment
+from .process import CommandResult, _prepare_command, codex_environment, executor_npm_cache
 from .report import (
     atomic_write_json,
     is_executor_report_shape,
@@ -101,6 +101,26 @@ def _normalise_report(message: str) -> str:
 
 def _json_error(message: str) -> str:
     return message.replace("\r", " ").replace("\n", " ")[:500]
+
+
+def _workspace_write_sandbox_policy(
+    repository: Path,
+    *,
+    network_access: bool = False,
+    npm_cache: Path | None = None,
+) -> dict[str, Any]:
+    root = repository.resolve()
+    writable_roots = [str(root)]
+    git_dir = root / ".git"
+    if git_dir.exists():
+        writable_roots.append(str(git_dir))
+    if npm_cache is not None:
+        writable_roots.append(str(npm_cache.resolve()))
+    return {
+        "type": "workspaceWrite",
+        "networkAccess": bool(network_access),
+        "writableRoots": writable_roots,
+    }
 
 
 def _error_message(response: dict[str, Any]) -> str:
@@ -400,12 +420,19 @@ class _AppServerProcess:
         with self._lock:
             return self._thread_id_for_unlocked(repository)
 
-    def _turn_unlocked(self, thread_id: str, prompt: str) -> dict[str, Any]:
+    def _turn_unlocked(self, thread_id: str, prompt: str, repository: Path) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": thread_id,
             "input": [{"type": "text", "text": prompt}],
             "approvalPolicy": "never" if self.agent.sandbox == "workspace-write" else "on-request",
+            "cwd": str(repository.resolve()),
         }
+        if self.agent.sandbox == "workspace-write":
+            params["sandboxPolicy"] = _workspace_write_sandbox_policy(
+                repository,
+                network_access=self.agent.network_access,
+                npm_cache=executor_npm_cache(self.agent),
+            )
         if self.agent.model:
             params["model"] = self.agent.model
         if self.agent.reasoning_effort:
@@ -467,9 +494,9 @@ class _AppServerProcess:
             "turn_status": completed.get("status"),
         }
 
-    def turn(self, thread_id: str, prompt: str) -> dict[str, Any]:
+    def turn(self, thread_id: str, prompt: str, repository: Path) -> dict[str, Any]:
         with self._lock:
-            return self._turn_unlocked(thread_id, prompt)
+            return self._turn_unlocked(thread_id, prompt, repository)
 
     def close(self) -> None:
         if self._closed:
@@ -497,14 +524,15 @@ class _AppServerProcess:
 
 
 _PROCESS_LOCK = threading.RLock()
-_PROCESSES: dict[tuple[str, str, str], _AppServerProcess] = {}
+_PROCESSES: dict[tuple[str, str, str, str], _AppServerProcess] = {}
 
 
-def _process_key(agent: AgentConfig, config: OrchestratorConfig) -> tuple[str, str, str]:
+def _process_key(agent: AgentConfig, config: OrchestratorConfig) -> tuple[str, str, str, str]:
     return (
         agent.account_name,
         str(agent.codex_home.expanduser().resolve()),
         str(Path(config.codex_command).resolve()),
+        str(bool(agent.network_access)),
     )
 
 
@@ -643,7 +671,7 @@ def run_codex_app_server(
             else:
                 set_context(None)
         thread_id, resumed = process.thread_id_for(repository)
-        turn = process.turn(thread_id, prompt)
+        turn = process.turn(thread_id, prompt, repository)
         assistant = turn["assistant"]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(_normalise_report(assistant), encoding="utf-8")

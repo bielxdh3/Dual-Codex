@@ -450,6 +450,7 @@ def _account_agent(config, account_name: str, role: str) -> AgentConfig:
         label=account.label,
         backend=account.backend,
         service_tier=account.service_tier,
+        network_access=account.network_access,
     )
 
 

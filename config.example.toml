@@ -28,6 +28,7 @@ model = ""
 reasoning_effort = "high"
 service_tier = ""
 backend = "windows"
+network_access = false
 
 [accounts.secondary]
 label = "Secondary account"
@@ -36,6 +37,7 @@ model = ""
 reasoning_effort = "high"
 service_tier = ""
 backend = "app_server"
+network_access = false
 
 [roles]
 orchestrator = "primary"

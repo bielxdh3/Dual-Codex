@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -153,6 +154,21 @@ def _run_with_progress(
 def codex_environment(agent: AgentConfig) -> dict[str, str]:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(agent.codex_home)
+    npm_cache = executor_npm_cache(agent)
+    npm_cache.mkdir(parents=True, exist_ok=True)
+    env["NPM_CONFIG_CACHE"] = str(npm_cache)
     for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"):
         env.pop(name, None)
     return env
+
+
+def executor_npm_cache(agent: AgentConfig) -> Path:
+    """Return a per-CODEX_HOME cache outside the target repository."""
+
+    local_app_data = Path(os.environ.get("LOCALAPPDATA", "")).expanduser()
+    if not local_app_data.is_absolute():
+        local_app_data = Path.home() / "AppData" / "Local"
+    identity = hashlib.sha256(
+        str(agent.codex_home.expanduser().resolve()).encode("utf-8")
+    ).hexdigest()[:16]
+    return (local_app_data.resolve() / "DualCodex" / "npm-cache" / identity).resolve()

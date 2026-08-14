@@ -15,12 +15,14 @@ from dual_codex.app_server import (
     _normalise_report,
     _process_key,
     _sanitize_stderr,
+    _workspace_write_sandbox_policy,
     app_server_call,
     run_codex_app_server,
 )
 from dual_codex.codex import _report_from_message
 from dual_codex.config import AgentConfig, OrchestratorConfig
 from dual_codex.live_events import read_journal
+from dual_codex.process import executor_npm_cache
 
 
 class _FakeStdout:
@@ -61,6 +63,7 @@ class _FakeProcess:
         self.stdin = _FakeStdin(self)
         self.returncode = None
         self.prompts: list[str] = []
+        self.turn_params: list[dict] = []
         self.thread_id = "thread-probe"
         self.turn_number = 0
 
@@ -106,6 +109,7 @@ class _FakeProcess:
             turn_id = f"turn-{self.turn_number}"
             text = message["params"]["input"][0]["text"]
             self.prompts.append(text)
+            self.turn_params.append(message["params"])
             report = {
                 "summary": "probe",
                 "files_changed": ["probe.txt"],
@@ -144,6 +148,7 @@ class AppServerTests(unittest.TestCase):
             root = Path(temp)
             repository = root / "repo"
             repository.mkdir()
+            (repository / ".git").mkdir()
             config = _config(root)
             agent = AgentConfig(
                 codex_home=root / "profile",
@@ -155,6 +160,8 @@ class AppServerTests(unittest.TestCase):
                 backend="app_server",
             )
             fake_processes: list[_FakeProcess] = []
+            with patch.dict("os.environ", {"LOCALAPPDATA": str(root / "localappdata")}):
+                expected_cache = executor_npm_cache(agent)
 
             def create(*args, **kwargs):
                 fake = _FakeProcess(*args, **kwargs)
@@ -164,7 +171,14 @@ class AppServerTests(unittest.TestCase):
                 return fake
 
             long_prompt = "x" * 2201
-            with patch.dict("os.environ", {"OPENAI_API_KEY": "secret", "CODEX_API_KEY": "secret"}), patch(
+            with patch.dict(
+                "os.environ",
+                {
+                    "OPENAI_API_KEY": "secret",
+                    "CODEX_API_KEY": "secret",
+                    "LOCALAPPDATA": str(root / "localappdata"),
+                },
+            ), patch(
                 "dual_codex.app_server.subprocess.Popen", side_effect=create
             ):
                 first = run_codex_app_server(
@@ -197,6 +211,19 @@ class AppServerTests(unittest.TestCase):
             self.assertEqual(second.metadata["task_transport"], "app_server")
             self.assertEqual(len(fake_processes), 1)
             self.assertEqual(fake_processes[0].prompts, ["short", long_prompt])
+            self.assertEqual(
+                fake_processes[0].turn_params[0]["sandboxPolicy"],
+                {
+                    "type": "workspaceWrite",
+                    "networkAccess": False,
+                    "writableRoots": [
+                        str(repository),
+                        str(repository / ".git"),
+                        str(expected_cache),
+                    ],
+                },
+            )
+            self.assertEqual(fake_processes[0].turn_params[0]["cwd"], str(repository))
             journal_path = Path(first.metadata["live_event_journal"])
             deadline = time.monotonic() + 1
             journal_events = read_journal(journal_path)
@@ -210,6 +237,50 @@ class AppServerTests(unittest.TestCase):
             self.assertTrue(all(event.run_id == "run-1" for event in journal_events))
             self.assertTrue(all(event.thread_id == "thread-probe" for event in journal_events))
             self.assertTrue(all(event.turn_id in {"turn-1", "turn-2"} for event in journal_events))
+
+    def test_network_access_is_explicit_and_fail_closed(self) -> None:
+        repository = Path("C:/repo")
+        disabled = _workspace_write_sandbox_policy(repository)
+        enabled = _workspace_write_sandbox_policy(repository, network_access=True)
+        self.assertFalse(disabled["networkAccess"])
+        self.assertTrue(enabled["networkAccess"])
+
+    def test_network_enabled_executor_turn_receives_scoped_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            (repository / ".git").mkdir()
+            agent = AgentConfig(
+                codex_home=root / "profile",
+                model="",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="biel4",
+                backend="app_server",
+                network_access=True,
+            )
+            fake = _FakeProcess()
+            with patch.dict("os.environ", {"LOCALAPPDATA": str(root / "localappdata")}):
+                expected_cache = executor_npm_cache(agent)
+                with patch("dual_codex.app_server.subprocess.Popen", return_value=fake):
+                    result = run_codex_app_server(
+                        config=_config(root),
+                        agent=agent,
+                        repository=repository,
+                        prompt="network probe",
+                        output_path=root / "result.json",
+                        session_id="network-session",
+                    )
+            self.assertEqual(result.returncode, 0)
+            policy = fake.turn_params[0]["sandboxPolicy"]
+            self.assertTrue(policy["networkAccess"])
+            self.assertEqual(policy["writableRoots"][:2], [str(repository), str(repository / ".git")])
+            self.assertEqual(policy["writableRoots"][2], str(expected_cache))
+            for process in list(_PROCESSES.values()):
+                process.close()
+            _PROCESSES.clear()
+            time.sleep(0.1)
 
     def test_server_requests_are_denied_without_escalation(self) -> None:
         # The real probe used approvalPolicy=never and emitted no requests. This
