@@ -88,6 +88,7 @@ PUBLICATION_ACTIONS = (
     "local_mutation",
     "local_commit",
     "normal_push",
+    "create_branch",
     "branch_publication",
     "draft_pr_create",
     "draft_pr_update",

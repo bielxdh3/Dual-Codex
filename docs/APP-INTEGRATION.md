@@ -41,7 +41,7 @@ executor estiver sem role ou sem login.
 ```
 
 Para uma missao explicitamente autorizada, substitua a lista vazia pelas
-acoes exatas, por exemplo `local_commit`, `normal_push`, `draft_pr_create` e
+acoes exatas, por exemplo `local_commit`, `normal_push`, `create_branch`, `draft_pr_create` e
 `draft_pr_update`; nao inclua capacidades nao necessarias.
 
 O pedido `correct` reutiliza o texto original da tarefa e inclui, por exemplo:
@@ -66,6 +66,8 @@ negada por padrao; quando o pedido inclui autorizacao explicita, somente as
 acoes listadas em `authorization.allowed_actions` podem ser solicitadas.
 Autorizacao para `normal_push` nao inclui `force_push`, e autorizacao para
 Draft PR nao inclui merge, release, tag ou deploy.
+`create_branch` e uma autorizacao separada: exige que a branch remota esteja
+ausente e nunca atualiza uma branch existente.
 
 Operacoes autenticadas de GitHub nao sao executadas dentro do sandbox do
 Executor. O control plane pode encaminhar uma solicitacao tipada ao broker

@@ -64,11 +64,13 @@ dual-codex role ...
 ```
 
 `publish` e o broker local de host para operacoes tipadas de publicacao. Ele
-aceita somente `normal_push`, `draft_pr_create` ou `draft_pr_update`, valida a
+aceita somente `normal_push`, `create_branch`, `draft_pr_create` ou `draft_pr_update`, valida a
 allow-list de autorizacao existente, a identidade do repositorio e a
 autenticacao GitHub do host, e nunca recebe tokens. O push usa Git OpenSSL com
 verificacao de certificados, exige SHA remoto esperado, descendencia
-fast-forward e revalida o SHA depois da operacao. O comando nao aceita shell,
+fast-forward e revalida o SHA depois da operacao. `create_branch` exige estado
+remoto ausente, valida a branch e publica somente o SHA exato em
+`refs/heads/...`; uma branch existente nunca e atualizada. O comando nao aceita shell,
 force-push, merge, release, tag, deploy ou mutacao destrutiva. O App Server nao
 recebe acesso ao credential store; o broker deve ser chamado pelo control
 plane confiavel no contexto normal do host.

@@ -20,8 +20,8 @@ from .paths import same_path
 from .process import CommandResult, run_command
 
 
-PublicationOperation = Literal["normal_push", "draft_pr_create", "draft_pr_update"]
-PUBLICATION_OPERATIONS = frozenset({"normal_push", "draft_pr_create", "draft_pr_update"})
+PublicationOperation = Literal["normal_push", "create_branch", "draft_pr_create", "draft_pr_update"]
+PUBLICATION_OPERATIONS = frozenset({"normal_push", "create_branch", "draft_pr_create", "draft_pr_update"})
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _MISSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _REPOSITORY_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -57,7 +57,9 @@ class PublicationRequest:
     remote: str = "origin"
     branch: str = ""
     expected_remote_old_sha: str = ""
+    expected_remote_state: str = ""
     new_sha: str = ""
+    expected_base_sha: str = ""
     pr_number: int | None = None
     expected_pr_head_sha: str = ""
     expected_pr_state: str = "open"
@@ -87,6 +89,15 @@ class PublicationRequest:
             _validate_branch(self.branch)
             _validate_sha(self.expected_remote_old_sha)
             _validate_sha(self.new_sha)
+        elif self.operation == "create_branch":
+            _validate_branch(self.branch, classification="INVALID_BRANCH_REF")
+            _validate_sha(self.new_sha)
+            if self.expected_remote_state != "absent":
+                raise PublicationError("MALFORMED_PUBLICATION_REQUEST", "New branch publication requires expected remote state 'absent'.")
+            if self.expected_remote_old_sha:
+                raise PublicationError("MALFORMED_PUBLICATION_REQUEST", "New branch publication cannot include an existing remote SHA.")
+            if self.expected_base_sha:
+                _validate_sha(self.expected_base_sha)
         elif self.operation == "draft_pr_update":
             if not isinstance(self.pr_number, int) or isinstance(self.pr_number, bool) or self.pr_number <= 0:
                 raise PublicationError("MALFORMED_PUBLICATION_REQUEST", "A positive PR number is required.")
@@ -120,8 +131,12 @@ class PublicationResult:
     pr_number: int | None = None
     expected_remote_old_sha: str = ""
     observed_remote_old_sha: str = ""
+    expected_remote_state: str = ""
+    observed_pre_state: str = ""
+    observed_remote_state: str = ""
     requested_new_sha: str = ""
     observed_remote_new_sha: str = ""
+    created: bool = False
     fast_forward: bool = False
     remote_state: str = ""
     error_classification: str = ""
@@ -138,8 +153,12 @@ class PublicationResult:
             "pr_number": self.pr_number,
             "expected_remote_old_sha": self.expected_remote_old_sha,
             "observed_remote_old_sha": self.observed_remote_old_sha,
+            "expected_remote_state": self.expected_remote_state,
+            "observed_pre_state": self.observed_pre_state,
+            "observed_remote_state": self.observed_remote_state,
             "requested_new_sha": self.requested_new_sha,
             "observed_remote_new_sha": self.observed_remote_new_sha,
+            "created": self.created,
             "fast_forward": self.fast_forward,
             "remote_state": self.remote_state,
             "error_classification": self.error_classification,
@@ -153,7 +172,7 @@ def _validate_sha(value: str) -> str:
     return value.lower()
 
 
-def _validate_branch(value: str) -> str:
+def _validate_branch(value: str, *, classification: str = "MALFORMED_PUBLICATION_REQUEST") -> str:
     if (
         not isinstance(value, str)
         or not value
@@ -162,7 +181,7 @@ def _validate_branch(value: str) -> str:
         or value.endswith((".", "/"))
         or any(marker in value for marker in _REF_FORBIDDEN)
     ):
-        raise PublicationError("MALFORMED_PUBLICATION_REQUEST", "Invalid Git branch name.")
+        raise PublicationError(classification, "Invalid Git branch name.")
     return value
 
 
@@ -248,23 +267,34 @@ def _result(request: PublicationRequest, *, status: str, classification: str = "
     )
 
 
-def _safe_repository_scope(request: PublicationRequest, runner: Runner) -> None:
+def _safe_repository_scope(
+    request: PublicationRequest,
+    runner: Runner,
+    *,
+    classification: str = "REPOSITORY_SCOPE_DENIED",
+) -> None:
     repository = request.repository.expanduser().resolve()
     if not repository.is_dir():
-        raise PublicationError("REPOSITORY_SCOPE_DENIED", "Repository path is not a directory.")
+        raise PublicationError(classification, "Repository path is not a directory.")
     root = _run(runner, ["git", "rev-parse", "--show-toplevel"], cwd=repository)
     if root.returncode != 0 or not same_path(repository, Path(root.stdout.strip())):
-        raise PublicationError("REPOSITORY_SCOPE_DENIED", "Requested path is not the repository root.")
+        raise PublicationError(classification, "Requested path is not the repository root.")
     for remote_args in (
         ["git", "remote", "get-url", request.remote],
         ["git", "remote", "get-url", "--push", request.remote],
     ):
         remote = _run(runner, remote_args, cwd=repository)
         if remote.returncode != 0 or not _canonical_repository_url(remote.stdout, request.repository_full_name):
-            raise PublicationError("REPOSITORY_SCOPE_DENIED", "Remote is not the authorized GitHub repository.")
+            raise PublicationError(classification, "Remote is not the authorized GitHub repository.")
 
 
-def _host_authentication(runner: Runner, repository: Path, full_name: str) -> None:
+def _host_authentication(
+    runner: Runner,
+    repository: Path,
+    full_name: str,
+    *,
+    write_classification: str = "GITHUB_WRITE_PERMISSION_UNVERIFIED",
+) -> None:
     status = _run(runner, ["gh", "auth", "status", "--active", "--hostname", HOST_GITHUB], cwd=repository, network=True)
     if status.returncode != 0:
         raise PublicationError("HOST_GITHUB_AUTH_NOT_READY", "Host GitHub authentication is unavailable.")
@@ -278,16 +308,16 @@ def _host_authentication(runner: Runner, repository: Path, full_name: str) -> No
         network=True,
     )
     if permissions.returncode != 0:
-        raise PublicationError("GITHUB_WRITE_PERMISSION_UNVERIFIED", "Repository permission probe failed.")
+        raise PublicationError(write_classification, "Repository permission probe failed.")
     try:
         value = json.loads(permissions.stdout)
     except (TypeError, ValueError):
         value = {}
     if value.get("full_name", "").casefold() != full_name.casefold() or value.get("permissions", {}).get("push") is not True:
-        raise PublicationError("GITHUB_WRITE_PERMISSION_UNVERIFIED", "Authenticated repository write permission was not proven.")
+        raise PublicationError(write_classification, "Authenticated repository write permission was not proven.")
 
 
-def _remote_sha(request: PublicationRequest, runner: Runner) -> str:
+def _remote_ref_sha(request: PublicationRequest, runner: Runner) -> str | None:
     result = _run(
         runner,
         _git_network_command(
@@ -301,11 +331,23 @@ def _remote_sha(request: PublicationRequest, runner: Runner) -> str:
     )
     if result.returncode != 0:
         raise PublicationError("PUBLICATION_CONNECTIVITY_BLOCKED", "Remote branch read failed.")
-    line = next((item for item in result.stdout.splitlines() if item.strip()), "")
+    lines = [item for item in result.stdout.splitlines() if item.strip()]
+    if not lines:
+        return None
+    if len(lines) != 1:
+        raise PublicationError("REMOTE_STATE_UNREADABLE", "Remote branch state was not safely parsed.")
+    line = lines[0]
     parts = line.split()
     if len(parts) != 2 or parts[1] != f"refs/heads/{request.branch}" or not _SHA.fullmatch(parts[0]):
         raise PublicationError("REMOTE_STATE_UNREADABLE", "Remote branch state was not safely parsed.")
     return parts[0].lower()
+
+
+def _remote_sha(request: PublicationRequest, runner: Runner) -> str:
+    value = _remote_ref_sha(request, runner)
+    if value is None:
+        raise PublicationError("REMOTE_STATE_UNREADABLE", "Remote branch state was not safely parsed.")
+    return value
 
 
 def _verify_push_inputs(request: PublicationRequest, runner: Runner) -> None:
@@ -340,6 +382,9 @@ def _execute_push(request: PublicationRequest, runner: Runner) -> PublicationRes
             remote_state="unchanged",
         )
     _host_authentication(runner, request.repository, request.repository_full_name)
+    # A non-force create refspec is advertised with a zero old-id; receive-pack
+    # rejects a branch that appears after the absent-state precheck instead of
+    # fast-forwarding or overwriting it.
     push = _run(
         runner,
         _git_network_command(
@@ -391,6 +436,115 @@ def _execute_push(request: PublicationRequest, runner: Runner) -> PublicationRes
         fast_forward=True,
         remote_state="updated",
         detail="Normal fast-forward push completed and remote head was reverified.",
+    )
+
+
+def _validate_new_branch_ref(request: PublicationRequest, runner: Runner) -> None:
+    if request.branch.casefold() == "head" or request.branch.casefold().startswith("refs/"):
+        raise PublicationError("INVALID_BRANCH_REF", "New branch must be a non-special branch name.")
+    checked = _run(runner, ["git", "check-ref-format", "--branch", request.branch], cwd=request.repository)
+    if checked.returncode != 0:
+        raise PublicationError("INVALID_BRANCH_REF", "New branch name failed Git ref validation.")
+
+
+def _verify_create_inputs(request: PublicationRequest, runner: Runner) -> None:
+    _validate_new_branch_ref(request, runner)
+    local_ref = _run(runner, ["git", "rev-parse", f"refs/heads/{request.branch}"], cwd=request.repository)
+    if local_ref.returncode != 0 or local_ref.stdout.strip().lower() != request.new_sha.lower():
+        raise PublicationError("LOCAL_BRANCH_MISMATCH", "Local branch does not equal the requested new SHA.")
+    object_check = _run(runner, ["git", "rev-parse", "--verify", f"{request.new_sha}^{{commit}}"], cwd=request.repository)
+    if object_check.returncode != 0:
+        raise PublicationError("LOCAL_SHA_MISMATCH", "Requested commit SHA is not a local commit.")
+    if request.expected_base_sha:
+        ancestry = _run(
+            runner,
+            ["git", "merge-base", "--is-ancestor", request.expected_base_sha, request.new_sha],
+            cwd=request.repository,
+        )
+        if ancestry.returncode != 0:
+            raise PublicationError("BASE_ANCESTRY_MISMATCH", "Requested new SHA does not descend from the expected base SHA.")
+
+
+def _execute_create_branch(request: PublicationRequest, runner: Runner) -> PublicationResult:
+    _safe_repository_scope(request, runner, classification="REPOSITORY_SCOPE_MISMATCH")
+    _verify_create_inputs(request, runner)
+    observed = _remote_ref_sha(request, runner)
+    if observed is not None:
+        return _result(
+            request,
+            status="blocked",
+            classification="REMOTE_BRANCH_ALREADY_EXISTS",
+            detail="Remote branch already exists; create-only publication performed no mutation.",
+            branch=request.branch,
+            expected_remote_state="absent",
+            observed_pre_state="present",
+            observed_remote_state="present",
+            requested_new_sha=request.new_sha.lower(),
+            observed_remote_old_sha=observed,
+            remote_state="unchanged",
+        )
+    _host_authentication(
+        runner,
+        request.repository,
+        request.repository_full_name,
+        write_classification="HOST_GITHUB_WRITE_NOT_AUTHORIZED",
+    )
+    push = _run(
+        runner,
+        _git_network_command(
+            "push",
+            "--no-force",
+            "--porcelain",
+            request.remote,
+            f"{request.new_sha.lower()}:refs/heads/{request.branch}",
+        ),
+        cwd=request.repository,
+        network=True,
+    )
+    if push.returncode != 0:
+        classification = "PUBLICATION_AUTHENTICATION_BLOCKED" if any(
+            marker in (push.stderr or "").casefold()
+            for marker in ("credential", "authentication", "authorization", "bearer", "could not read username", "401", "403")
+        ) else "PUBLICATION_CONNECTIVITY_BLOCKED"
+        return _result(
+            request,
+            status="blocked",
+            classification=classification,
+            detail="New branch publication failed; no credential or command output was retained.",
+            branch=request.branch,
+            expected_remote_state="absent",
+            observed_pre_state="absent",
+            observed_remote_state="absent_before_push",
+            requested_new_sha=request.new_sha.lower(),
+            remote_state="unchanged_or_unknown",
+        )
+    observed_new = _remote_sha(request, runner)
+    if observed_new != request.new_sha.lower():
+        return _result(
+            request,
+            status="blocked",
+            classification="PUBLICATION_POSTCONDITION_MISMATCH",
+            detail="Remote branch head did not equal the requested SHA after creation.",
+            branch=request.branch,
+            expected_remote_state="absent",
+            observed_pre_state="absent",
+            observed_remote_state="created",
+            requested_new_sha=request.new_sha.lower(),
+            observed_remote_new_sha=observed_new,
+            remote_state="post_verify_failed",
+        )
+    return _result(
+        request,
+        status="completed",
+        branch=request.branch,
+        expected_remote_state="absent",
+        observed_pre_state="absent",
+        observed_remote_state="created",
+        requested_new_sha=request.new_sha.lower(),
+        observed_remote_new_sha=observed_new,
+        created=True,
+        remote_state="created",
+        detail="New remote branch was created and its exact head was reverified.",
     )
 
 
@@ -490,6 +644,8 @@ def execute_publication(request: PublicationRequest, *, runner: Runner = run_com
     try:
         if request.operation == "normal_push":
             return _execute_push(request, runner)
+        if request.operation == "create_branch":
+            return _execute_create_branch(request, runner)
         if request.operation == "draft_pr_update":
             return _execute_pr_update(request, runner)
         return _execute_pr_create(request, runner)
@@ -504,7 +660,7 @@ def publication_request_from_json(raw: Any) -> PublicationRequest:
         raise PublicationError("MALFORMED_PUBLICATION_REQUEST", "Publication request must be an object.")
     allowed = {
         "operation", "mission_id", "repository", "repository_full_name", "authorization", "authorization_reference", "remote", "branch",
-        "expected_remote_old_sha", "new_sha", "pr_number", "expected_pr_head_sha", "expected_pr_state",
+        "expected_remote_old_sha", "expected_remote_state", "new_sha", "expected_base_sha", "pr_number", "expected_pr_head_sha", "expected_pr_state",
         "expected_pr_draft", "expected_pr_base", "title", "body", "base_branch", "draft",
     }
     unknown = set(raw) - allowed
@@ -544,7 +700,9 @@ def publication_request_from_json(raw: Any) -> PublicationRequest:
         remote=string_field("remote", "origin"),
         branch=string_field("branch"),
         expected_remote_old_sha=string_field("expected_remote_old_sha"),
+        expected_remote_state=string_field("expected_remote_state"),
         new_sha=string_field("new_sha"),
+        expected_base_sha=string_field("expected_base_sha"),
         pr_number=raw.get("pr_number"),
         expected_pr_head_sha=string_field("expected_pr_head_sha"),
         expected_pr_state=string_field("expected_pr_state", "open"),
