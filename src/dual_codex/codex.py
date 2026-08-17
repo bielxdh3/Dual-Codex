@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import AgentConfig
-from .process import CommandResult, codex_environment, run_command
+from .process import CommandError, CommandResult, codex_environment, run_command
 
 
 def run_codex_app_server(**kwargs) -> CommandResult:
@@ -80,6 +80,60 @@ def run_codex_exec(
     )
 
 
+def run_codex_for_role(
+    *,
+    config,
+    agent: AgentConfig,
+    role: str,
+    repository: Path,
+    prompt: str,
+    output_path: Path,
+    schema_path: Path,
+    request_id: str = "",
+    run_id: str = "",
+    progress: Callable[[str], None] | None = None,
+) -> CommandResult:
+    """Dispatch orchestration through the configured account backend."""
+    if agent.backend == "app_server":
+        from .terminal import session_id_for
+
+        result = run_codex_app_server(
+            config=config,
+            agent=agent,
+            repository=repository,
+            prompt=prompt,
+            output_path=output_path,
+            session_id=session_id_for(agent.account_name, repository),
+            request_id=request_id,
+            run_id=run_id,
+            role=role,
+            progress=progress,
+        )
+        if result.returncode != 0:
+            raise CommandError(
+                f"Codex {role} failed through the configured App Server backend: {result.stderr}"
+            )
+        return result
+    if agent.backend != "windows":
+        raise ValueError(f"Unsupported Codex backend '{agent.backend}'.")
+    from .terminal import session_id_for
+
+    result = run_codex_terminal(
+        config=config,
+        agent=agent,
+        repository=repository,
+        prompt=prompt,
+        output_path=output_path,
+        session_id=session_id_for(agent.account_name, repository),
+        progress=progress,
+    )
+    if result.returncode != 0:
+        raise CommandError(
+            f"Codex {role} failed through the configured Windows terminal backend: {result.stderr}"
+        )
+    return result
+
+
 def run_codex_terminal(
     *,
     config,
@@ -93,7 +147,7 @@ def run_codex_terminal(
     reuse_existing: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> CommandResult:
-    from .terminal import TerminalError, TerminalManager
+    from .terminal import TerminalError, TerminalManager, TerminalSetupRequiredError
 
     transport = "file" if task_artifact_path is not None else "inline"
     artifact = str(task_artifact_path.resolve()) if task_artifact_path is not None else ""
@@ -227,6 +281,9 @@ def run_codex_terminal(
             },
         )
     except TerminalError as exc:
+        metadata["terminal_error_type"] = type(exc).__name__
+        if isinstance(exc, TerminalSetupRequiredError):
+            metadata["terminal_setup_required"] = True
         return CommandResult(
             ["codex", "--no-alt-screen", "--sandbox", agent.sandbox],
             1,

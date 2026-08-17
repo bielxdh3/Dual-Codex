@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from dual_codex.config import load_config
 from dual_codex.delegation import (
+    DelegationError,
     InvalidRequestError,
     RepositoryLock,
     _pid_alive,
@@ -248,6 +249,56 @@ class DelegationTests(unittest.TestCase):
                 session_id_for("executor", repository),
             )
             self.assertTrue(terminal.call_args.kwargs["reuse_existing"])
+
+    def test_app_server_executor_ignores_stale_windows_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = _make_repository(root)
+            base = _make_config(root, repository)
+            executor = replace(base.accounts["executor"], backend="app_server")
+            config = replace(base, accounts={**base.accounts, "executor": executor})
+            expected = CommandResult(["codex", "app-server", "--stdio"], 0, "", "")
+            with patch("dual_codex.delegation.run_codex_app_server", return_value=expected) as app_server, patch(
+                "dual_codex.terminal.TerminalManager"
+            ) as terminal:
+                result = run_delegation_codex_exec(
+                    config=config,
+                    agent=config.executor,
+                    repository=repository,
+                    prompt="Read the harmless brief.",
+                    output_path=root / "report.json",
+                    schema_path=root / "schema.json",
+                    check=False,
+                    reuse_existing=False,
+                )
+
+            self.assertIs(result, expected)
+            self.assertEqual(app_server.call_args.kwargs["agent"].backend, "app_server")
+            self.assertEqual(app_server.call_args.kwargs["role"], "executor")
+            terminal.assert_not_called()
+
+    def test_delegation_rejects_unknown_backend_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = _make_repository(root)
+            config = _make_config(root, repository)
+            agent = replace(config.executor, backend="unknown")
+            with patch("dual_codex.delegation.run_codex_terminal") as terminal, patch(
+                "dual_codex.delegation._run_codex_exec_legacy"
+            ) as legacy:
+                with self.assertRaisesRegex(DelegationError, "no fallback is permitted"):
+                    run_delegation_codex_exec(
+                        config=config,
+                        agent=agent,
+                        repository=repository,
+                        prompt="Read the harmless brief.",
+                        output_path=root / "report.json",
+                        schema_path=root / "schema.json",
+                        check=False,
+                    )
+
+            terminal.assert_not_called()
+            legacy.assert_not_called()
 
     def test_legacy_adapter_keeps_schema_and_check_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

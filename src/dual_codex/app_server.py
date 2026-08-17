@@ -314,7 +314,9 @@ class _AppServerProcess:
         except queue.Empty as exc:
             raise AppServerError("Timed out waiting for App Server JSON-RPC data.") from exc
         if line is None:
-            raise AppServerError("App Server process exited unexpectedly.")
+            stderr = _sanitize_stderr(self.stderr_tail)
+            detail = f": {stderr}" if stderr else "."
+            raise AppServerError(f"App Server process exited unexpectedly{detail}")
         try:
             message = json.loads(line)
         except (TypeError, ValueError) as exc:

@@ -430,6 +430,21 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(response["id"], 1)
         self.assertEqual(process._next_message.call_count, 2)
 
+    def test_process_exit_preserves_sanitized_stderr_diagnostic(self) -> None:
+        from collections import deque
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        process._messages = queue.Queue()
+        process._messages.put(None)
+        process._stderr = deque(['state=auth.json token="secret-value"'])
+
+        with self.assertRaisesRegex(AppServerError, "process exited unexpectedly") as raised:
+            process._next_message(0.1)
+
+        self.assertIn("[REDACTED_AUTH_PATH]", str(raised.exception))
+        self.assertNotIn("secret-value", str(raised.exception))
+
     def test_report_normalisation_keeps_existing_delegation_shape(self) -> None:
         value = json.loads(
             _normalise_report(

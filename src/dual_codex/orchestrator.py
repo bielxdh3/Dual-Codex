@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .codex import run_codex_exec
+from .codex import run_codex_for_role
 from .config import OrchestratorConfig
 from .git import ensure_git_repository, status_and_diff, status_porcelain
 from .report import dump_json, load_json, render_markdown
@@ -49,9 +49,10 @@ def execute(config: OrchestratorConfig, task_file: Path) -> RunOutcome:
     (run_dir / "task.md").write_text(task + "\n", encoding="utf-8")
 
     plan_path = run_dir / "plan.json"
-    run_codex_exec(
-        codex_command=config.codex_command,
+    run_codex_for_role(
+        config=config,
         agent=config.agent_for_role("architect"),
+        role="architect",
         repository=config.repository,
         prompt=_prompt(config, "architect.txt", task=task),
         output_path=plan_path,
@@ -60,9 +61,10 @@ def execute(config: OrchestratorConfig, task_file: Path) -> RunOutcome:
     plan = load_json(plan_path)
 
     implementation_path = run_dir / "implementation.json"
-    run_codex_exec(
-        codex_command=config.codex_command,
+    run_codex_for_role(
+        config=config,
         agent=config.agent_for_role("executor"),
+        role="executor",
         repository=config.repository,
         prompt=_prompt(config, "executor.txt", task=task, plan=dump_json(plan)),
         output_path=implementation_path,
@@ -75,9 +77,10 @@ def execute(config: OrchestratorConfig, task_file: Path) -> RunOutcome:
         diff_text = status_and_diff(config.repository)
         (run_dir / f"diff-{correction_cycles}.md").write_text(diff_text, encoding="utf-8")
         review_path = run_dir / f"review-{correction_cycles}.json"
-        run_codex_exec(
-            codex_command=config.codex_command,
+        run_codex_for_role(
+            config=config,
             agent=config.agent_for_role("reviewer"),
+            role="reviewer",
             repository=config.repository,
             prompt=_prompt(
                 config,
@@ -98,9 +101,10 @@ def execute(config: OrchestratorConfig, task_file: Path) -> RunOutcome:
 
         correction_cycles += 1
         implementation_path = run_dir / f"correction-{correction_cycles}.json"
-        run_codex_exec(
-            codex_command=config.codex_command,
+        run_codex_for_role(
+            config=config,
             agent=config.agent_for_role("executor"),
+            role="executor",
             repository=config.repository,
             prompt=_prompt(
                 config,

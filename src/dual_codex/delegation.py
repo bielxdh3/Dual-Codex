@@ -50,6 +50,10 @@ def run_codex_exec(**kwargs):
         app_server_kwargs["run_id"] = kwargs.get("run_id", app_server_kwargs["session_id"])
         app_server_kwargs["role"] = kwargs.get("role", "executor")
         return run_codex_app_server(**app_server_kwargs)
+    if agent is None or agent.backend != "windows":
+        raise DelegationError(
+            f"Unsupported Codex backend '{getattr(agent, 'backend', '')}'; no fallback is permitted."
+        )
     command_name = Path(config.codex_command).stem.casefold() if config else "codex"
     if kwargs.get("reuse_existing") and not command_name.startswith("codex"):
         raise DelegationError("Strict reuse-existing refuses non-Codex or non-native fallback backends.")

@@ -154,9 +154,10 @@ def _run_with_progress(
 def codex_environment(agent: AgentConfig) -> dict[str, str]:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(agent.codex_home)
-    npm_cache = executor_npm_cache(agent)
-    npm_cache.mkdir(parents=True, exist_ok=True)
-    env["NPM_CONFIG_CACHE"] = str(npm_cache)
+    # The Codex child creates this scoped cache when it needs it.  Environment
+    # construction must remain read-only: the Architect may be read-only and
+    # a managed host may deny writes to the account profile's parent.
+    env["NPM_CONFIG_CACHE"] = str(executor_npm_cache(agent))
     for name in ("OPENAI_API_KEY", "CODEX_API_KEY", "AZURE_OPENAI_API_KEY"):
         env.pop(name, None)
     return env
