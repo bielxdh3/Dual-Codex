@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 import atexit
 import json
+import os
 from pathlib import Path
 import queue
 import re
@@ -26,6 +27,23 @@ class AppServerError(RuntimeError):
 
 
 _EVENT_PUBLICATION_QUEUE_SIZE = 64
+_HEADLESS_WINDOWS_SANDBOX_OVERRIDE = 'windows.sandbox="unelevated"'
+
+
+def _app_server_command(config: OrchestratorConfig) -> list[str]:
+    """Build the non-interactive App Server command.
+
+    The Windows ``elevated`` sandbox implementation starts a UAC/setup helper
+    when a turn first executes a command. An App Server launched on stdio has
+    no UAC ceremony, so use the ACL-based implementation for this transport
+    only. The configured account backend and normal Windows/TUI path are not
+    changed.
+    """
+
+    command = [config.codex_command, "app-server", "--stdio"]
+    if os.name == "nt":
+        command.extend(["-c", _HEADLESS_WINDOWS_SANDBOX_OVERRIDE])
+    return command
 
 
 def _report_object(message: str) -> dict[str, Any] | None:
@@ -155,6 +173,7 @@ class _AppServerProcess:
     ) -> None:
         self.config = config
         self.agent = agent
+        self.repository = repository.resolve()
         self.progress = progress
         self._lock = threading.RLock()
         self._next_id = 0
@@ -169,7 +188,7 @@ class _AppServerProcess:
         ] = queue.Queue(maxsize=_EVENT_PUBLICATION_QUEUE_SIZE)
         self._event_publication_stop = threading.Event()
         self._closed = False
-        command = [config.codex_command, "app-server", "--stdio"]
+        command = _app_server_command(config)
         process_args = _prepare_command([str(item) for item in command])
         env = codex_environment(agent)
         self.process = subprocess.Popen(
@@ -297,6 +316,31 @@ class _AppServerProcess:
         # turns use approvalPolicy=never; an unexpected request is a hard denial.
         if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
             result: Any = {"decision": "decline"}
+        elif method == "item/tool/call":
+            # Dynamic tools are client-owned. Returning a protocol-shaped
+            # failure is important: an error response leaves the call without
+            # a custom-tool output and the upstream turn retries until timeout.
+            # Built-in commandExecution remains available to headless turns.
+            result = {
+                "success": False,
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": (
+                            "Dynamic tools are unavailable in the headless Dual Codex "
+                            "App Server; use built-in command execution."
+                        ),
+                    }
+                ],
+            }
+        elif method == "item/tool/requestUserInput":
+            result = {"answers": {}}
+        elif method == "mcpServer/elicitation/request":
+            result = {"action": "decline"}
+        elif method == "currentTime/read":
+            result = {"currentTimeAt": int(time.time())}
+        elif method == "item/permissions/requestApproval":
+            result = {"permissions": {}, "scope": "turn", "strictAutoReview": False}
         elif method in {"applyPatchApproval", "execCommandApproval"}:
             result = {"decision": {"denied": {"rejection": "Dual Codex does not auto-approve requests."}}}
         else:
@@ -526,15 +570,20 @@ class _AppServerProcess:
 
 
 _PROCESS_LOCK = threading.RLock()
-_PROCESSES: dict[tuple[str, str, str, str], _AppServerProcess] = {}
+_PROCESSES: dict[tuple[str, str, str, str, str], _AppServerProcess] = {}
 
 
-def _process_key(agent: AgentConfig, config: OrchestratorConfig) -> tuple[str, str, str, str]:
+def _process_key(
+    agent: AgentConfig,
+    config: OrchestratorConfig,
+    repository: Path | None = None,
+) -> tuple[str, str, str, str, str]:
     return (
         agent.account_name,
         str(agent.codex_home.expanduser().resolve()),
         str(Path(config.codex_command).resolve()),
         str(bool(agent.network_access)),
+        str(repository.expanduser().resolve()) if repository is not None else "",
     )
 
 
@@ -544,7 +593,7 @@ def _get_process(
     repository: Path,
     progress: Callable[[str], None] | None,
 ) -> _AppServerProcess:
-    key = _process_key(agent, config)
+    key = _process_key(agent, config, repository)
     with _PROCESS_LOCK:
         process = _PROCESSES.get(key)
         if process is not None and process.process.poll() is None:
@@ -566,10 +615,13 @@ def _close_processes() -> None:
 
 
 def _discard_process(process: _AppServerProcess) -> None:
-    key = _process_key(process.agent, process.config)
+    repository = getattr(process, "repository", None)
+    key = _process_key(process.agent, process.config, repository)
     with _PROCESS_LOCK:
         if _PROCESSES.get(key) is process:
             _PROCESSES.pop(key, None)
+    if repository is not None:
+        _delete_thread_mapping(process.config, process.agent, Path(repository))
     process.close()
 
 
@@ -593,6 +645,7 @@ def _load_thread_mapping(config: OrchestratorConfig, agent: AgentConfig, reposit
         value.get("repository") != str(repository.resolve())
         or value.get("account") != agent.account_name
         or value.get("codex_home") != str(agent.codex_home.resolve())
+        or value.get("headless_windows_sandbox") != ("unelevated" if os.name == "nt" else "")
     ):
         return None
     thread_id = value.get("thread_id")
@@ -609,8 +662,23 @@ def _save_thread_mapping(config: OrchestratorConfig, agent: AgentConfig, reposit
             "codex_home": str(agent.codex_home.resolve()),
             "repository": str(repository.resolve()),
             "thread_id": thread_id,
+            "headless_windows_sandbox": "unelevated" if os.name == "nt" else "",
         },
     )
+
+
+def _delete_thread_mapping(config: OrchestratorConfig, agent: AgentConfig, repository: Path) -> None:
+    """Forget a thread that may contain an unresolved client tool call."""
+
+    path = _mapping_path(config, agent, repository)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # A stale mapping must never prevent a fresh App Server process from
+        # starting; the next successful turn overwrites it atomically.
+        pass
 
 
 def _is_stale_thread_error(response: dict[str, Any]) -> bool:
@@ -633,7 +701,7 @@ def run_codex_app_server(
     role: str = "executor",
     progress: Callable[[str], None] | None = None,
 ) -> CommandResult:
-    command = [config.codex_command, "app-server", "--stdio"]
+    command = _app_server_command(config)
     metadata: dict[str, str] = {
         "app_server_session_id": session_id,
         "task_transport": "app_server",
@@ -743,7 +811,7 @@ def app_server_events(
     repository: Path,
 ) -> list[dict[str, Any]]:
     """Return the in-memory notification tail for a healthy account process."""
-    key = _process_key(agent, config)
+    key = _process_key(agent, config, repository)
     with _PROCESS_LOCK:
         process = _PROCESSES.get(key)
         if process is None or process.process.poll() is not None:

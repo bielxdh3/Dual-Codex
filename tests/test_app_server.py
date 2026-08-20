@@ -12,8 +12,11 @@ from unittest.mock import Mock, patch
 from dual_codex.app_server import (
     AppServerError,
     _PROCESSES,
+    _app_server_command,
+    _mapping_path,
     _normalise_report,
     _process_key,
+    _save_thread_mapping,
     _sanitize_stderr,
     _workspace_write_sandbox_policy,
     app_server_call,
@@ -245,6 +248,26 @@ class AppServerTests(unittest.TestCase):
         self.assertFalse(disabled["networkAccess"])
         self.assertTrue(enabled["networkAccess"])
 
+    def test_headless_app_server_forces_unelevated_windows_sandbox(self) -> None:
+        command = _app_server_command(_config(Path("C:/dual-codex-test")))
+        self.assertIn("-c", command)
+        self.assertIn('windows.sandbox="unelevated"', command)
+
+    def test_process_key_is_scoped_to_repository(self) -> None:
+        config = _config(Path("C:/dual-codex-test"))
+        agent = AgentConfig(
+            codex_home=Path("C:/profile"),
+            model="",
+            reasoning_effort="high",
+            sandbox="workspace-write",
+            account_name="executor",
+            backend="app_server",
+        )
+        self.assertNotEqual(
+            _process_key(agent, config, Path("C:/repo-a")),
+            _process_key(agent, config, Path("C:/repo-b")),
+        )
+
     def test_network_enabled_executor_turn_receives_scoped_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -292,6 +315,23 @@ class AppServerTests(unittest.TestCase):
         process._send = sent.append
         process._respond_to_server_request({"id": 7, "method": "item/commandExecution/requestApproval"})
         self.assertEqual(sent[0]["result"], {"decision": "decline"})
+
+    def test_dynamic_tool_request_returns_structured_custom_output(self) -> None:
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        sent: list[dict] = []
+        process._send = sent.append
+        process._respond_to_server_request(
+            {
+                "id": 8,
+                "method": "item/tool/call",
+                "params": {"tool": "probe", "callId": "call-1"},
+            }
+        )
+        self.assertEqual(sent[0]["result"]["success"], False)
+        self.assertEqual(sent[0]["result"]["contentItems"][0]["type"], "inputText")
+        self.assertIn("headless Dual Codex App Server", sent[0]["result"]["contentItems"][0]["text"])
 
     def test_event_journal_failure_cannot_change_notification_handling(self) -> None:
         from collections import deque
@@ -518,9 +558,11 @@ class AppServerTests(unittest.TestCase):
             process = object.__new__(type("Process", (), {}))
             process.agent = agent
             process.config = config
+            process.repository = repository
             process.thread_id_for = Mock(side_effect=AppServerError("turn timed out"))
             process.close = Mock()
-            key = _process_key(agent, config)
+            _save_thread_mapping(config, agent, repository, "stale-thread")
+            key = _process_key(agent, config, repository)
             _PROCESSES[key] = process
             with patch("dual_codex.app_server._get_process", return_value=process):
                 result = run_codex_app_server(
@@ -533,6 +575,7 @@ class AppServerTests(unittest.TestCase):
                 )
             self.assertEqual(result.returncode, 1)
             self.assertNotIn(key, _PROCESSES)
+            self.assertFalse(_mapping_path(config, agent, repository).exists())
             process.close.assert_called_once_with()
 
 
