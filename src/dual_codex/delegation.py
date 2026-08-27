@@ -923,6 +923,55 @@ def _read_only_validation_succeeded(report: Mapping[str, Any]) -> bool:
     return any(marker in text for marker in _READ_ONLY_SUCCESS_MARKERS)
 
 
+def _app_server_tool_attestation_error(
+    report: Mapping[str, Any] | None,
+    command_result: CommandResult,
+) -> str:
+    """Reject an App Server report that claims commands without wire evidence.
+
+    The assistant report is not proof that a tool ran. The App Server adapter
+    records completed command items separately; when that metadata is present,
+    require at least one successful item before accepting a report that claims
+    command/test execution. Older non-App-Server test doubles may omit the
+    metadata and retain their existing behavior.
+    """
+
+    if report is None or "app_server_tool_executions" not in command_result.metadata:
+        return ""
+    claimed_commands = _report_list(report, "commands_run")
+    claimed_tests = [
+        item
+        for item in _report_list(report, "tests")
+        if isinstance(item, Mapping) and str(item.get("command", "")).strip()
+    ]
+    if not claimed_commands and not claimed_tests:
+        return ""
+    executions = command_result.metadata.get("app_server_tool_executions")
+    if not isinstance(executions, list):
+        executions = []
+    successful = any(
+        isinstance(item, Mapping)
+        and str(item.get("status", "")).casefold() == "completed"
+        and (
+            item.get("exitCode") == 0
+            or item.get("success") is True
+        )
+        for item in executions
+    )
+    if successful:
+        custom_outputs = command_result.metadata.get("app_server_custom_tool_outputs")
+        if isinstance(custom_outputs, list) and any(
+            isinstance(item, Mapping) and item.get("success") is False
+            for item in custom_outputs
+        ):
+            return "App Server returned a failed custom-tool output; the report cannot be accepted as a successful execution."
+        return ""
+    return (
+        "App Server executor report claims command/test execution, but the App Server "
+        "notification stream contains no completed successful tool execution."
+    )
+
+
 def _classify_executor_result(
     *,
     report: Mapping[str, Any] | None,
@@ -1207,6 +1256,11 @@ def delegate(
                 command_result=command_result,
                 repository_unchanged=git_status == initial_git_status,
             )
+            if status == "completed" and agent.backend == "app_server":
+                tool_attestation_error = _app_server_tool_attestation_error(report, command_result)
+                if tool_attestation_error:
+                    status = "failed"
+                    error = tool_attestation_error
             if head_changed:
                 status = "failed"
                 error = (

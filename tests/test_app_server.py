@@ -67,6 +67,7 @@ class _FakeProcess:
         self.returncode = None
         self.prompts: list[str] = []
         self.turn_params: list[dict] = []
+        self.thread_params: list[dict] = []
         self.thread_id = "thread-probe"
         self.turn_number = 0
 
@@ -104,6 +105,7 @@ class _FakeProcess:
                 }
             )
         elif method == "thread/start":
+            self.thread_params.append(message["params"])
             self._emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": self.thread_id}}})
         elif method == "thread/resume":
             self._emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": self.thread_id}}})
@@ -226,6 +228,7 @@ class AppServerTests(unittest.TestCase):
                     ],
                 },
             )
+            self.assertTrue(fake_processes[0].thread_params[0].get("experimentalRawEvents"))
             self.assertEqual(fake_processes[0].turn_params[0]["cwd"], str(repository))
             journal_path = Path(first.metadata["live_event_journal"])
             deadline = time.monotonic() + 1
@@ -332,6 +335,29 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(sent[0]["result"]["success"], False)
         self.assertEqual(sent[0]["result"]["contentItems"][0]["type"], "inputText")
         self.assertIn("headless Dual Codex App Server", sent[0]["result"]["contentItems"][0]["text"])
+
+    def test_raw_custom_tool_output_is_bounded_to_reconciliation_fields(self) -> None:
+        from dual_codex.app_server import _raw_response_item_evidence
+
+        evidence = _raw_response_item_evidence(
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco-1",
+                "call_id": "call-1",
+                "name": "exec",
+                "input": "do not retain this input",
+                "encrypted_content": "do not retain reasoning",
+                "output": [
+                    {"type": "input_text", "text": "Exit code: 0\\nOutput: ok"},
+                ],
+            }
+        )
+        self.assertEqual(evidence["type"], "custom_tool_call_output")
+        self.assertEqual(evidence["call_id"], "call-1")
+        self.assertEqual(evidence["output"][0]["text"], r"Exit code: 0\nOutput: ok")
+        self.assertTrue(evidence["success"])
+        self.assertNotIn("input", evidence)
+        self.assertNotIn("encrypted_content", evidence)
 
     def test_event_journal_failure_cannot_change_notification_handling(self) -> None:
         from collections import deque

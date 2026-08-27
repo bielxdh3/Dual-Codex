@@ -10,7 +10,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .config import AgentConfig, OrchestratorConfig
 from .live_events import LiveEventJournal
@@ -28,6 +28,7 @@ class AppServerError(RuntimeError):
 
 _EVENT_PUBLICATION_QUEUE_SIZE = 64
 _HEADLESS_WINDOWS_SANDBOX_OVERRIDE = 'windows.sandbox="unelevated"'
+_HEADLESS_RAW_EVENTS_VERSION = "responses-raw-v1"
 
 
 def _app_server_command(config: OrchestratorConfig) -> list[str]:
@@ -146,6 +147,91 @@ def _error_message(response: dict[str, Any]) -> str:
     if isinstance(error, dict):
         return _json_error(str(error.get("message") or error))
     return _json_error(str(error or "App Server request failed."))
+
+
+def _raw_response_item_evidence(item: Any) -> dict[str, Any] | None:
+    """Keep only the raw Responses items needed to reconcile tool output.
+
+    ``experimentalRawEvents`` also emits prompts and encrypted reasoning. Those
+    are deliberately not retained by the adapter; the App Server journal needs
+    the tool call identity and output only.
+    """
+
+    if not isinstance(item, Mapping):
+        return None
+    item_type = str(item.get("type", ""))
+    if item_type not in {"custom_tool_call", "custom_tool_call_output"}:
+        return {
+            "type": item_type,
+            "id": _json_error(str(item.get("id", ""))),
+        }
+    evidence: dict[str, Any] = {
+        "type": item_type,
+        "id": _json_error(str(item.get("id", ""))),
+        "call_id": _json_error(str(item.get("call_id", ""))),
+    }
+    for key in ("name", "namespace"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            evidence[key] = _json_error(value)
+    if item_type == "custom_tool_call_output":
+        output = item.get("output")
+        if isinstance(output, list):
+            safe_output: list[dict[str, str]] = []
+            for content in output[:16]:
+                if not isinstance(content, Mapping):
+                    continue
+                content_type = str(content.get("type", ""))
+                text = content.get("text")
+                if content_type == "input_text" and isinstance(text, str):
+                    safe_output.append({"type": content_type, "text": _json_error(text)})
+                elif content_type in {"input_image", "input_audio"}:
+                    safe_output.append({"type": content_type, "text": "[REDACTED_MEDIA]"})
+            evidence["output"] = safe_output
+            rendered_output = " ".join(item["text"] for item in safe_output)
+            if re.search(r"(?i)exit\s+code\s*:\s*0\b", rendered_output):
+                evidence["success"] = True
+            elif re.search(r"(?i)(?:script\s+failed|exit\s+code\s*:\s*[1-9]\d*|\"error\"\s*:)", rendered_output):
+                evidence["success"] = False
+    return evidence
+
+
+def _tool_item_evidence(item: Any) -> dict[str, Any] | None:
+    """Extract bounded, non-reasoning evidence for a completed tool item."""
+
+    if not isinstance(item, Mapping):
+        return None
+    item_type = str(item.get("type", ""))
+    if item_type not in {"commandExecution", "mcpToolCall", "dynamicToolCall"}:
+        return None
+    evidence: dict[str, Any] = {
+        "type": item_type,
+        "id": _json_error(str(item.get("id", ""))),
+        "status": _json_error(str(item.get("status", ""))),
+    }
+    for key in ("cwd", "command", "server", "tool", "exitCode", "durationMs", "success"):
+        value = item.get(key)
+        if isinstance(value, (str, int, bool)):
+            evidence[key] = _json_error(value) if isinstance(value, str) else value
+    actions = item.get("commandActions")
+    if isinstance(actions, list) and actions:
+        first = actions[0]
+        if isinstance(first, Mapping) and isinstance(first.get("command"), str):
+            evidence["command"] = _json_error(first["command"])
+    output = item.get("aggregatedOutput")
+    if isinstance(output, str):
+        evidence["aggregatedOutput"] = _sanitize_stderr(output)
+    content_items = item.get("contentItems")
+    if isinstance(content_items, list):
+        evidence["contentItems"] = [
+            {
+                "type": str(content.get("type", "")),
+                "text": _json_error(str(content.get("text", ""))),
+            }
+            for content in content_items[:16]
+            if isinstance(content, Mapping) and content.get("type") in {"inputText", "input_text"}
+        ]
+    return evidence
 
 
 _AUTH_PATH = re.compile(r"(?i)(?:[A-Za-z]:)?[^\r\n\s\"']*auth\.json")
@@ -284,6 +370,7 @@ class _AppServerProcess:
                     return
                 continue
             if publication is None:
+                self._event_publications.task_done()
                 return
             journal, method, params, context = publication
             try:
@@ -291,8 +378,8 @@ class _AppServerProcess:
             except Exception:
                 # Journal contention/failure must not affect protocol handling.
                 pass
-            if stop is not None and stop.is_set() and self._event_publications.empty():
-                return
+            finally:
+                self._event_publications.task_done()
 
     def _send(self, message: dict[str, Any]) -> None:
         if self._closed or self.process.poll() is not None:
@@ -353,28 +440,49 @@ class _AppServerProcess:
         self._send(response)
 
     def _next_message(self, timeout: float) -> dict[str, Any]:
-        try:
-            line = self._messages.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise AppServerError("Timed out waiting for App Server JSON-RPC data.") from exc
-        if line is None:
-            stderr = _sanitize_stderr(self.stderr_tail)
-            detail = f": {stderr}" if stderr else "."
-            raise AppServerError(f"App Server process exited unexpectedly{detail}")
-        try:
-            message = json.loads(line)
-        except (TypeError, ValueError) as exc:
-            raise AppServerError("App Server emitted invalid JSON-RPC data.") from exc
-        if not isinstance(message, dict):
-            raise AppServerError("App Server emitted a non-object JSON-RPC message.")
-        if "method" in message and "id" in message:
-            self._respond_to_server_request(message)
-            return self._next_message(timeout)
-        return message
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AppServerError("Timed out waiting for App Server JSON-RPC data.")
+            try:
+                line = self._messages.get(timeout=remaining)
+            except queue.Empty as exc:
+                raise AppServerError("Timed out waiting for App Server JSON-RPC data.") from exc
+            if line is None:
+                stderr = _sanitize_stderr(self.stderr_tail)
+                detail = f": {stderr}" if stderr else "."
+                raise AppServerError(f"App Server process exited unexpectedly{detail}")
+            try:
+                message = json.loads(line)
+            except (TypeError, ValueError) as exc:
+                raise AppServerError("App Server emitted invalid JSON-RPC data.") from exc
+            if not isinstance(message, dict):
+                raise AppServerError("App Server emitted a non-object JSON-RPC message.")
+            if "method" in message and "id" in message:
+                # Preserve client-owned dynamic-tool calls in the same
+                # provenance stream as notifications before replying.
+                self._record_notification(message)
+                self._respond_to_server_request(message)
+                continue
+            return message
 
     def _record_notification(self, message: dict[str, Any]) -> None:
         if "method" in message:
-            self._events.append(message)
+            event_message = message
+            if message.get("method") == "rawResponseItem/completed":
+                params = message.get("params")
+                if isinstance(params, dict):
+                    safe_params: dict[str, Any] = {
+                        key: params[key]
+                        for key in ("threadId", "turnId")
+                        if key in params
+                    }
+                    safe_item = _raw_response_item_evidence(params.get("item"))
+                    if safe_item is not None:
+                        safe_params["item"] = safe_item
+                    event_message = {**message, "params": safe_params}
+            self._events.append(event_message)
             journal = getattr(self, "_event_journal", None)
             publications = getattr(self, "_event_publications", None)
             if journal is not None and publications is not None:
@@ -382,8 +490,8 @@ class _AppServerProcess:
                     publications.put_nowait(
                         (
                             journal,
-                            str(message.get("method", "")),
-                            message.get("params") if isinstance(message.get("params"), dict) else {},
+                            str(event_message.get("method", "")),
+                            event_message.get("params") if isinstance(event_message.get("params"), dict) else {},
                             dict(getattr(self, "_event_context", {})),
                         )
                     )
@@ -436,6 +544,10 @@ class _AppServerProcess:
             "cwd": str(repository),
             "sandbox": self.agent.sandbox,
             "approvalPolicy": "never" if self.agent.sandbox == "workspace-write" else "on-request",
+            # The raw Responses stream is the App Server equivalent of the
+            # native executor's custom_tool_call_output records. It is scoped
+            # to the headless thread and does not alter the TUI/backend path.
+            "experimentalRawEvents": True,
         }
         if self.agent.model:
             params["model"] = self.agent.model
@@ -495,6 +607,27 @@ class _AppServerProcess:
 
         started = False
         completed: dict[str, Any] | None = None
+        tool_items: dict[tuple[str, str], dict[str, Any]] = {}
+        raw_custom_calls: dict[str, dict[str, Any]] = {}
+        raw_custom_outputs: dict[str, dict[str, Any]] = {}
+
+        def observe_item(item: Any) -> None:
+            evidence = _tool_item_evidence(item)
+            if evidence is not None:
+                key = (str(evidence.get("type", "")), str(evidence.get("id", "")))
+                tool_items[key] = evidence
+
+        def observe_raw(item: Any) -> None:
+            evidence = _raw_response_item_evidence(item)
+            if evidence is None:
+                return
+            item_type = evidence.get("type")
+            call_id = str(evidence.get("call_id", ""))
+            if item_type == "custom_tool_call" and call_id:
+                raw_custom_calls[call_id] = evidence
+            elif item_type == "custom_tool_call_output" and call_id:
+                raw_custom_outputs[call_id] = evidence
+
         deadline = time.monotonic() + self.config.app_server_turn_timeout
         last_progress = time.monotonic()
         while completed is None:
@@ -513,6 +646,10 @@ class _AppServerProcess:
             self._record_notification(message)
             method = message.get("method")
             event_params = message.get("params") or {}
+            if isinstance(event_params, Mapping):
+                observe_item(event_params.get("item"))
+                if method == "rawResponseItem/completed":
+                    observe_raw(event_params.get("item"))
             event_turn = event_params.get("turn") if isinstance(event_params, dict) else None
             event_turn_id = event_turn.get("id") if isinstance(event_turn, dict) else None
             if method == "turn/started" and event_turn_id == turn_id:
@@ -529,8 +666,16 @@ class _AppServerProcess:
         if completed.get("status") != "completed":
             raise AppServerError(f"App Server turn {turn_id} ended with status {completed.get('status')!r}.")
         items = completed.get("items") or []
+        for item in items:
+            observe_item(item)
         messages = [item.get("text", "") for item in items if isinstance(item, dict) and item.get("type") == "agentMessage"]
         assistant = str(messages[-1]) if messages else ""
+        missing_custom_outputs = sorted(set(raw_custom_calls) - set(raw_custom_outputs))
+        if missing_custom_outputs:
+            raise AppServerError(
+                "App Server completed turn with missing custom-tool output for call ids: "
+                + ", ".join(missing_custom_outputs)
+            )
         return {
             "thread_id": thread_id,
             "turn_id": turn_id,
@@ -538,22 +683,65 @@ class _AppServerProcess:
             "event_count": len(self._events),
             "turn_started": started,
             "turn_status": completed.get("status"),
+            "tool_executions": list(tool_items.values()),
+            "custom_tool_outputs": list(raw_custom_outputs.values()),
         }
 
     def turn(self, thread_id: str, prompt: str, repository: Path) -> dict[str, Any]:
         with self._lock:
             return self._turn_unlocked(thread_id, prompt, repository)
 
+    def run_turn_with_context(
+        self,
+        repository: Path,
+        prompt: str,
+        *,
+        journal: LiveEventJournal | None,
+        **context: str,
+    ) -> dict[str, Any]:
+        """Serialize provenance context with thread/resume and the turn.
+
+        A persistent App Server process can serve more than one orchestrator
+        request. Setting the journal outside this lock allowed concurrent
+        requests to attach one turn's notifications to another run.
+        """
+
+        with self._lock:
+            previous_journal = self._event_journal
+            previous_context = self._event_context
+            self._event_journal = journal
+            self._event_context = {str(key): str(value) for key, value in context.items()}
+            try:
+                thread_id, resumed = self._thread_id_for_unlocked(repository)
+                turn = self._turn_unlocked(thread_id, prompt, repository)
+                turn["thread_id"] = thread_id
+                turn["thread_resumed"] = resumed
+                return turn
+            finally:
+                self._event_journal = previous_journal
+                self._event_context = previous_context
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         stop = getattr(self, "_event_publication_stop", None)
+        # All protocol notifications for a completed turn have already been
+        # queued. Drain them before terminating the child so the final tool
+        # output cannot be lost from the reconciliable journal.
+        try:
+            self._event_publications.join()
+        except (AttributeError, RuntimeError):
+            pass
         if stop is not None:
             stop.set()
         try:
             self._event_publications.put_nowait(None)
         except (queue.Full, AttributeError):
+            pass
+        try:
+            self._event_publications.join()
+        except (AttributeError, RuntimeError):
             pass
         try:
             if self.process.stdin:
@@ -646,6 +834,7 @@ def _load_thread_mapping(config: OrchestratorConfig, agent: AgentConfig, reposit
         or value.get("account") != agent.account_name
         or value.get("codex_home") != str(agent.codex_home.resolve())
         or value.get("headless_windows_sandbox") != ("unelevated" if os.name == "nt" else "")
+        or value.get("headless_raw_events") != (_HEADLESS_RAW_EVENTS_VERSION if os.name == "nt" else "")
     ):
         return None
     thread_id = value.get("thread_id")
@@ -663,6 +852,7 @@ def _save_thread_mapping(config: OrchestratorConfig, agent: AgentConfig, reposit
             "repository": str(repository.resolve()),
             "thread_id": thread_id,
             "headless_windows_sandbox": "unelevated" if os.name == "nt" else "",
+            "headless_raw_events": _HEADLESS_RAW_EVENTS_VERSION if os.name == "nt" else "",
         },
     )
 
@@ -702,11 +892,20 @@ def run_codex_app_server(
     progress: Callable[[str], None] | None = None,
 ) -> CommandResult:
     command = _app_server_command(config)
-    metadata: dict[str, str] = {
+    metadata: dict[str, Any] = {
         "app_server_session_id": session_id,
         "task_transport": "app_server",
         "task_artifact": str(task_artifact_path.resolve()) if task_artifact_path else "",
         "task_sha256": task_sha256,
+        "app_server_backend": agent.backend,
+        "app_server_account": agent.account_name,
+        "app_server_repository": str(repository.resolve()),
+        "app_server_sandbox_override": _HEADLESS_WINDOWS_SANDBOX_OVERRIDE if os.name == "nt" else "",
+        "app_server_raw_events": os.name == "nt",
+        "app_server_tui": False,
+        "app_server_fallback": False,
+        "app_server_tool_executions": [],
+        "app_server_custom_tool_outputs": [],
     }
     journal: LiveEventJournal | None = None
     try:
@@ -728,20 +927,36 @@ def run_codex_app_server(
     process: _AppServerProcess | None = None
     try:
         process = _get_process(config, agent, repository, progress)
-        set_context = getattr(process, "set_event_context", None)
-        if callable(set_context):
-            if journal is not None:
-                set_context(
-                    journal,
-                    run_id=run_id or session_id,
-                    request_id=request_id,
-                    account=agent.account_name,
-                    role=role,
-                )
-            else:
-                set_context(None)
-        thread_id, resumed = process.thread_id_for(repository)
-        turn = process.turn(thread_id, prompt, repository)
+        run_with_context = getattr(process, "run_turn_with_context", None)
+        if callable(run_with_context):
+            turn = run_with_context(
+                repository,
+                prompt,
+                journal=journal,
+                run_id=run_id or session_id,
+                request_id=request_id,
+                account=agent.account_name,
+                role=role,
+            )
+            thread_id = str(turn["thread_id"])
+            resumed = bool(turn.get("thread_resumed", False))
+        else:
+            # Compatibility seam for older test doubles; production uses the
+            # serialized method above so provenance cannot cross requests.
+            set_context = getattr(process, "set_event_context", None)
+            if callable(set_context):
+                if journal is not None:
+                    set_context(
+                        journal,
+                        run_id=run_id or session_id,
+                        request_id=request_id,
+                        account=agent.account_name,
+                        role=role,
+                    )
+                else:
+                    set_context(None)
+            thread_id, resumed = process.thread_id_for(repository)
+            turn = process.turn(thread_id, prompt, repository)
         assistant = turn["assistant"]
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(_normalise_report(assistant), encoding="utf-8")
@@ -752,6 +967,8 @@ def run_codex_app_server(
                 "app_server_thread_resumed": str(resumed).lower(),
                 "app_server_process_id": str(process.pid),
                 "app_server_event_count": str(turn["event_count"]),
+                "app_server_tool_executions": turn.get("tool_executions", []),
+                "app_server_custom_tool_outputs": turn.get("custom_tool_outputs", []),
             }
         )
         return CommandResult(command, 0, assistant, _sanitize_stderr(process.stderr_tail), metadata)

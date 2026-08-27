@@ -31,7 +31,7 @@ _SECRET = re.compile(
     r"(?ix)(authorization\s*:\s*bearer\s+|\b(?:token|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\b\"?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,}]+)"
 )
 _HIDDEN_KEY = re.compile(
-    r"(?i)^(?:analysis|analysis_text|chain[_-]?of[_-]?thought|cot|hidden(?:_reasoning)?|internal[_-]?reasoning|reasoning(?:[_-]?(?:content|delta))?|thoughts?)$"
+    r"(?i)^(?:analysis|analysis_text|chain[_-]?of[_-]?thought|cot|encrypted[_-]?content|hidden(?:_reasoning)?|internal[_-]?reasoning|reasoning(?:[_-]?(?:content|delta))?|thoughts?)$"
 )
 _SENSITIVE_KEY = re.compile(
     r"(?i)(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret|credential|(?:^|[_-])token$)"
@@ -281,15 +281,20 @@ def normalize_notification(method: str, params: Mapping[str, Any] | None = None)
     params = params if isinstance(params, Mapping) else {}
     raw_method = str(method)
     lowered = raw_method.casefold()
+    item = params.get("item")
+    item_type = str(item.get("type", "")).casefold() if isinstance(item, Mapping) else ""
     if lowered.startswith("turn/"):
         kind = "turn"
         state = lowered.rsplit("/", 1)[-1]
         turn = params.get("turn")
         if isinstance(turn, Mapping) and isinstance(turn.get("status"), str) and state == "completed":
             state = turn["status"]
-    elif "commandexecution" in lowered or "command_execution" in lowered:
+    elif item_type == "commandexecution" or "commandexecution" in lowered or "command_execution" in lowered:
         kind = "command_execution"
         state = lowered.rsplit("/", 1)[-1].replace("outputdelta", "output").replace("delta", "output")
+    elif item_type in {"dynamictoolcall", "custom_tool_call", "custom_tool_call_output"} or "tool/call" in lowered or "custom_tool" in lowered:
+        kind = "custom_tool"
+        state = lowered.rsplit("/", 1)[-1].replace("completed", "output")
     elif "filechange" in lowered or "file_change" in lowered:
         kind = "file_change"
         state = lowered.rsplit("/", 1)[-1].replace("delta", "updated")

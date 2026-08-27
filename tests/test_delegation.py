@@ -23,6 +23,7 @@ from dual_codex.delegation import (
     parse_request,
     run_codex_exec as run_delegation_codex_exec,
     _classify_executor_result,
+    _app_server_tool_attestation_error,
     _prompt,
     _read_report,
     TASK_CONTROL_MESSAGE_MAX,
@@ -729,6 +730,39 @@ class DelegationTests(unittest.TestCase):
             repository_unchanged=True,
         )
         self.assertEqual((status, error), ("completed", ""))
+
+    def test_app_server_report_cannot_claim_tool_without_wire_execution(self) -> None:
+        report = {
+            "summary": "read-only probe completed",
+            "files_changed": [],
+            "commands_run": ["Get-Date -Format o"],
+            "tests": [{"command": "Get-Date -Format o", "status": "passed", "details": "model said it passed"}],
+            "remaining_issues": [],
+        }
+        failed = CommandResult(
+            ["codex", "app-server", "--stdio"],
+            0,
+            "",
+            "",
+            {"app_server_tool_executions": [], "app_server_custom_tool_outputs": []},
+        )
+        self.assertIn(
+            "no completed successful tool execution",
+            _app_server_tool_attestation_error(report, failed),
+        )
+
+        passed = CommandResult(
+            ["codex", "app-server", "--stdio"],
+            0,
+            "",
+            "",
+            {
+                "app_server_tool_executions": [
+                    {"type": "commandExecution", "status": "completed", "exitCode": 0}
+                ]
+            },
+        )
+        self.assertEqual(_app_server_tool_attestation_error(report, passed), "")
 
     def test_request_validation_rejects_version_malformed_and_unknown_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
