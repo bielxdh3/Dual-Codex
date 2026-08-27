@@ -87,6 +87,7 @@ class TuiReadinessDetector:
         self.seen_ready = False
         self.seen_model_ready = False
         self.seen_placeholder = False
+        self.seen_setup = False
         self.stable_samples = 0
         self.ready_evidence = ""
         self.target_model = ""
@@ -118,6 +119,8 @@ class TuiReadinessDetector:
         last_prompt = prompt_match.start() if prompt_match else -1
         last_trust = text.rfind("Do you trust the contents of this directory?")
         last_disabled = text.rfind("Input disabled until setup completes")
+        last_setup_continue = text.rfind("Press enter to continue and create a sandbox...")
+        last_setup_yes = text.rfind("1. Yes, continue")
         loading_matches = list(re.finditer(r"(?m)^\s*(?:\u2502\s*)?model:\s+loading\b", text))
         last_loading = loading_matches[-1].start() if loading_matches else -1
         model_matches = list(self._MODEL.finditer(text))
@@ -140,10 +143,22 @@ class TuiReadinessDetector:
         last_working = text.rfind("Working (")
         last_error = text.rfind("Error:")
 
-        if last_trust > max(last_prompt, last_banner) or last_disabled > max(last_prompt, last_banner):
+        last_normal_marker = max(last_model, last_directory, last_working, last_error, last_banner)
+        setup_dialog = (
+            last_trust >= 0
+            and last_trust > last_normal_marker
+            and (
+                last_setup_continue > last_trust
+                or last_setup_yes > last_trust
+                or last_prompt < 0
+            )
+        )
+        setup_disabled = last_disabled > last_normal_marker
+        if setup_dialog or setup_disabled:
             self.seen_trust |= last_trust >= 0
+            self.seen_setup = True
             self.stable_samples = 0
-            self.state = self.SETUP_REQUIRED if last_trust > max(last_prompt, last_banner) else self.NOT_READY
+            self.state = self.SETUP_REQUIRED
             return self.state
         if "Error:" in text[-2000:] and last_prompt < last_working:
             self.stable_samples = 0
@@ -203,6 +218,7 @@ class TuiReadinessDetector:
             "state": self.state,
             "seen_update": self.seen_update,
             "seen_trust": self.seen_trust,
+            "seen_setup": self.seen_setup,
             "seen_ready": self.seen_ready,
             "seen_model_ready": self.seen_model_ready,
             "seen_placeholder": self.seen_placeholder,
@@ -278,6 +294,51 @@ class TuiComposerAckDetector:
 
 class TerminalError(RuntimeError):
     pass
+
+
+class TerminalSetupRequiredError(TerminalError):
+    """The Codex TUI is waiting for an explicit repository trust decision."""
+
+    def __init__(self, session_id: str, diagnostics: dict[str, Any]) -> None:
+        self.session_id = session_id
+        self.diagnostics = dict(diagnostics)
+        super().__init__(
+            f"Codex TUI requires explicit repository trust/setup for session '{session_id}': "
+            f"{json.dumps(self.diagnostics, ensure_ascii=False)}"
+        )
+
+
+def _process_is_alive(pid: int) -> bool | None:
+    """Return False only when Windows confirms that a PID is gone."""
+
+    if int(pid) <= 0:
+        return False
+    if os.name != "nt":
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return None
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False if ctypes.get_last_error() in {6, 87, 1168} else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
 
 
 def validate_pipe_name(value: str, *, session_id: str = "") -> str:
@@ -923,6 +984,16 @@ class TerminalManager:
                 self._remove_record(session_id)
         return health
 
+    @staticmethod
+    def _stale_session_record(session: TerminalSession) -> bool:
+        recorded_identity = str(getattr(session, "process_start_identity", "") or "")
+        actual_identity = _process_start_identity(int(getattr(session, "pid", 0) or 0))
+        if recorded_identity and actual_identity:
+            return actual_identity != recorded_identity
+        if actual_identity:
+            return False
+        return _process_is_alive(int(getattr(session, "pid", 0) or 0)) is False
+
     def _handle_attempt_failure(
         self,
         session: TerminalSession,
@@ -1062,10 +1133,7 @@ class TerminalManager:
                 diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
                 self._handle_attempt_failure(session, diagnostics, lifecycle, session_id=session_id)
                 self._write_readiness_diagnostics(session, diagnostics)
-                raise TerminalError(
-                    f"Codex TUI requires explicit repository trust/setup for session '{session_id}': "
-                    f"{json.dumps(diagnostics, ensure_ascii=False)}"
-                )
+                raise TerminalSetupRequiredError(session_id, diagnostics)
             if state == TuiReadinessDetector.FAILED:
                 diagnostics = detector.diagnostics()
                 diagnostics["elapsed_seconds"] = round(time.monotonic() - started, 3)
@@ -1411,7 +1479,9 @@ class TerminalManager:
             if current.get("state") in {"running", "starting"}:
                 raise TerminalError(f"Terminal session '{session_id}' already exists.")
             if current.get("state") == "unreachable":
-                raise TerminalError(f"Existing terminal session '{session_id}' could not be verified.")
+                stale = self._stale_session_record(self._load(session_id))
+                if not stale:
+                    raise TerminalError(f"Existing terminal session '{session_id}' could not be verified.")
             record_path.unlink()
         sessions = _session_dir(self.config)
         sessions.mkdir(parents=True, exist_ok=True)
@@ -1518,6 +1588,10 @@ class TerminalManager:
                 return self._load(session_id)
             if current.get("state") in {"exited", "identity_invalid"}:
                 self._remove_record(session_id)
+            elif current.get("state") == "unreachable":
+                session = self._load(session_id)
+                if self._stale_session_record(session):
+                    self._remove_record(session_id)
         return self.start(visible=visible, **kwargs)
 
     def reuse_existing(

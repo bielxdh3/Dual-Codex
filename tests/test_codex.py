@@ -8,13 +8,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from dual_codex.codex import run_codex_exec, run_codex_terminal
+from dual_codex.codex import run_codex_exec, run_codex_for_role, run_codex_terminal
 from dual_codex.config import AgentConfig
 from dual_codex.process import CommandResult, _prepare_command
 from dual_codex.terminal import TerminalError
 
 
-def _agent(sandbox: str) -> AgentConfig:
+def _agent(sandbox: str, *, backend: str = "windows") -> AgentConfig:
     return AgentConfig(
         codex_home=Path("C:/CodexProfiles/test"),
         model="",
@@ -22,10 +22,85 @@ def _agent(sandbox: str) -> AgentConfig:
         sandbox=sandbox,
         account_name="test-account",
         label="Test account",
+        backend=backend,
     )
 
 
 class CodexCommandTests(unittest.TestCase):
+    def test_windows_role_dispatch_uses_canonical_terminal_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "target"
+            repository.mkdir()
+            expected = CommandResult(["codex", "terminal"], 0, "", "")
+            config = type("Config", (), {"codex_command": "codex"})()
+            with patch("dual_codex.codex.run_codex_terminal", return_value=expected) as terminal, patch(
+                "dual_codex.codex.run_codex_exec"
+            ) as direct:
+                result = run_codex_for_role(
+                    config=config,
+                    agent=_agent("read-only", backend="windows"),
+                    role="architect",
+                    repository=repository,
+                    prompt="Read the harmless brief.",
+                    output_path=root / "plan.json",
+                    schema_path=root / "schema.json",
+                )
+
+            self.assertIs(result, expected)
+            self.assertTrue(terminal.call_args.kwargs["session_id"].startswith("test-account-"))
+            self.assertEqual(terminal.call_args.kwargs["agent"].backend, "windows")
+            direct.assert_not_called()
+
+    def test_role_dispatch_uses_app_server_without_terminal_handshake(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "target"
+            repository.mkdir()
+            output_path = root / "report.json"
+            expected = CommandResult(["codex", "app-server", "--stdio"], 0, "", "")
+            config = type("Config", (), {"codex_command": "codex"})()
+            with patch("dual_codex.codex.run_codex_app_server", return_value=expected) as app_server, patch(
+                "dual_codex.terminal.TerminalManager"
+            ) as terminal:
+                result = run_codex_for_role(
+                    config=config,
+                    agent=_agent("workspace-write", backend="app_server"),
+                    role="executor",
+                    repository=repository,
+                    prompt="Read the harmless brief.",
+                    output_path=output_path,
+                    schema_path=root / "schema.json",
+                )
+
+            self.assertIs(result, expected)
+            self.assertEqual(app_server.call_args.kwargs["role"], "executor")
+            self.assertEqual(app_server.call_args.kwargs["agent"].backend, "app_server")
+            self.assertEqual(app_server.call_args.kwargs["repository"], repository)
+            terminal.assert_not_called()
+
+    def test_role_dispatch_rejects_unknown_backend_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            agent = _agent("workspace-write", backend="unknown")
+            config = type("Config", (), {"codex_command": "codex"})()
+            with patch("dual_codex.codex.run_codex_exec") as direct, patch(
+                "dual_codex.codex.run_codex_app_server"
+            ) as app_server:
+                with self.assertRaisesRegex(ValueError, "Unsupported Codex backend"):
+                    run_codex_for_role(
+                        config=config,
+                        agent=agent,
+                        role="executor",
+                        repository=root,
+                        prompt="Read the harmless brief.",
+                        output_path=root / "report.json",
+                        schema_path=root / "schema.json",
+                    )
+
+            direct.assert_not_called()
+            app_server.assert_not_called()
+
     def test_terminal_capture_normalizes_executor_result_before_schema_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

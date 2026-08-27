@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from dual_codex.config import load_config
 from dual_codex.delegation import (
+    DelegationError,
     InvalidRequestError,
     RepositoryLock,
     _pid_alive,
@@ -22,6 +23,8 @@ from dual_codex.delegation import (
     parse_request,
     run_codex_exec as run_delegation_codex_exec,
     _classify_executor_result,
+    _app_server_tool_attestation_error,
+    _prompt,
     _read_report,
     TASK_CONTROL_MESSAGE_MAX,
 )
@@ -106,6 +109,48 @@ def _request(repository: Path, *, action: str = "implement") -> dict:
 
 
 class DelegationTests(unittest.TestCase):
+    def test_request_authorization_is_explicit_and_deny_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = _make_repository(root)
+            config = _make_config(root, repository)
+
+            denied = parse_request(_request(repository), config)
+            self.assertFalse(denied.authorization.allows("local_commit"))
+            self.assertFalse(denied.authorization.allows("normal_push"))
+            self.assertEqual(denied.authorization.as_dict(), {"allowed_actions": []})
+
+            authorized_raw = _request(repository)
+            authorized_raw["constraints"] = ["Do not commit or push by default"]
+            authorized_raw["authorization"] = {
+                "allowed_actions": ["local_mutation", "local_commit", "normal_push", "draft_pr_update"]
+            }
+            authorized = parse_request(authorized_raw, config)
+            self.assertTrue(authorized.authorization.allows("local_mutation"))
+            self.assertTrue(authorized.authorization.allows("local_commit"))
+            self.assertTrue(authorized.authorization.allows("normal_push"))
+            self.assertTrue(authorized.authorization.allows("draft_pr_update"))
+            self.assertFalse(authorized.authorization.allows("force_push"))
+            self.assertFalse(authorized.authorization.allows("merge"))
+            prompt = _prompt(authorized)
+            self.assertIn('"normal_push"', prompt)
+            self.assertIn('"draft_pr_update"', prompt)
+            self.assertIn("overrides a generic default prohibition", prompt)
+            self.assertIn("Normal push never authorizes force-push", prompt)
+            self.assertIn("Draft PR operations never authorize merge", prompt)
+
+            malformed = (
+                {"authorization": []},
+                {"authorization": {"unexpected": []}},
+                {"authorization": {"allowed_actions": ["local_commit", "local_commit"]}},
+                {"authorization": {"allowed_actions": ["unknown_action"]}},
+                {"authorization": {"allowed_actions": [""]}},
+            )
+            for override in malformed:
+                with self.subTest(override=override):
+                    with self.assertRaises(InvalidRequestError):
+                        parse_request({**_request(repository), **override}, config)
+
     def test_valid_structured_report_ignores_transport_transcript_failure_markers(self) -> None:
         report = {
             "summary": "Implementation and tests completed.",
@@ -206,6 +251,56 @@ class DelegationTests(unittest.TestCase):
             )
             self.assertTrue(terminal.call_args.kwargs["reuse_existing"])
 
+    def test_app_server_executor_ignores_stale_windows_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = _make_repository(root)
+            base = _make_config(root, repository)
+            executor = replace(base.accounts["executor"], backend="app_server")
+            config = replace(base, accounts={**base.accounts, "executor": executor})
+            expected = CommandResult(["codex", "app-server", "--stdio"], 0, "", "")
+            with patch("dual_codex.delegation.run_codex_app_server", return_value=expected) as app_server, patch(
+                "dual_codex.terminal.TerminalManager"
+            ) as terminal:
+                result = run_delegation_codex_exec(
+                    config=config,
+                    agent=config.executor,
+                    repository=repository,
+                    prompt="Read the harmless brief.",
+                    output_path=root / "report.json",
+                    schema_path=root / "schema.json",
+                    check=False,
+                    reuse_existing=False,
+                )
+
+            self.assertIs(result, expected)
+            self.assertEqual(app_server.call_args.kwargs["agent"].backend, "app_server")
+            self.assertEqual(app_server.call_args.kwargs["role"], "executor")
+            terminal.assert_not_called()
+
+    def test_delegation_rejects_unknown_backend_without_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = _make_repository(root)
+            config = _make_config(root, repository)
+            agent = replace(config.executor, backend="unknown")
+            with patch("dual_codex.delegation.run_codex_terminal") as terminal, patch(
+                "dual_codex.delegation._run_codex_exec_legacy"
+            ) as legacy:
+                with self.assertRaisesRegex(DelegationError, "no fallback is permitted"):
+                    run_delegation_codex_exec(
+                        config=config,
+                        agent=agent,
+                        repository=repository,
+                        prompt="Read the harmless brief.",
+                        output_path=root / "report.json",
+                        schema_path=root / "schema.json",
+                        check=False,
+                    )
+
+            terminal.assert_not_called()
+            legacy.assert_not_called()
+
     def test_legacy_adapter_keeps_schema_and_check_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -261,6 +356,76 @@ class DelegationTests(unittest.TestCase):
             self.assertEqual(error, "")
             self.assertIsNotNone(report)
             self.assertEqual(report["commands_run"], [])
+
+    def test_report_validation_canonicalises_blocked_extended_executor_result(self) -> None:
+        rich_report = {
+            "status": "BLOCKED_NO_MUTATION",
+            "starting_sha": "UNKNOWN",
+            "final_sha": "UNKNOWN",
+            "files_changed": [],
+            "behavior_changed": "None",
+            "validations_run": [],
+            "validations_not_run": ["push verification", "remote status"],
+            "remaining_limitations": ["No remote mutation was attempted."],
+            "next_plan_tree_item": "None",
+            "commands_run": ["git status --short"],
+            "push_result": "Not attempted",
+            "remote_result": "Not checked",
+            "pr_result": "Not updated",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "blocked-rich-report.json"
+            path.write_text(json.dumps(rich_report), encoding="utf-8")
+            report, error = _read_report(path)
+        self.assertEqual(error, "")
+        self.assertEqual(
+            set(report or {}),
+            {"summary", "files_changed", "commands_run", "tests", "remaining_issues"},
+        )
+        self.assertIn("BLOCKED_NO_MUTATION", report["summary"])
+        self.assertEqual(report["files_changed"], [])
+        self.assertEqual(report["commands_run"], ["git status --short"])
+        self.assertEqual([item["status"] for item in report["tests"]], ["not_run", "not_run"])
+        self.assertIn("No remote mutation was attempted.", report["remaining_issues"])
+
+    def test_report_validation_rejects_unknown_extended_result_fields(self) -> None:
+        rich_report = {
+            "status": "BLOCKED_NO_MUTATION",
+            "starting_sha": "UNKNOWN",
+            "final_sha": "UNKNOWN",
+            "files_changed": [],
+            "behavior_changed": "None",
+            "validations_run": [],
+            "validations_not_run": [],
+            "remaining_limitations": [],
+            "commands_run": [],
+            "unexpected": "must remain rejected",
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "invalid-rich-report.json"
+            path.write_text(json.dumps(rich_report), encoding="utf-8")
+            report, error = _read_report(path)
+        self.assertIsNone(report)
+        self.assertIn("schema validation failed", error)
+
+    def test_report_validation_rejects_invalid_extended_field_types(self) -> None:
+        rich_report = {
+            "status": "BLOCKED_NO_MUTATION",
+            "starting_sha": "UNKNOWN",
+            "final_sha": "UNKNOWN",
+            "files_changed": [],
+            "behavior_changed": {"unexpected": "object"},
+            "validations_run": [],
+            "validations_not_run": [],
+            "remaining_limitations": [],
+            "commands_run": [],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "invalid-rich-type-report.json"
+            path.write_text(json.dumps(rich_report), encoding="utf-8")
+            report, error = _read_report(path)
+        self.assertIsNone(report)
+        self.assertIn("schema validation failed", error)
 
     def test_report_validation_rejects_invalid_telemetry_and_missing_semantics(self) -> None:
         cases = (
@@ -345,6 +510,10 @@ class DelegationTests(unittest.TestCase):
             control_message = execute_mock.call_args.kwargs["prompt"]
             artifact_text = artifact.read_text(encoding="utf-8")
             self.assertIn("Implement the requested change.", artifact_text)
+            self.assertIn("Trusted mission authorization", artifact_text)
+            self.assertIn('"allowed_actions": []', artifact_text)
+            self.assertIn("Every publication or remote action not listed above is denied", artifact_text)
+            self.assertNotIn("Do not commit, push, open a pull request, merge, publish, or release.", artifact_text)
             self.assertNotIn("Implement the requested change.\n\nUse the real repository.", control_message)
             self.assertNotRegex(control_message, r"[\r\n]")
             self.assertLessEqual(len(control_message), TASK_CONTROL_MESSAGE_MAX)
@@ -561,6 +730,39 @@ class DelegationTests(unittest.TestCase):
             repository_unchanged=True,
         )
         self.assertEqual((status, error), ("completed", ""))
+
+    def test_app_server_report_cannot_claim_tool_without_wire_execution(self) -> None:
+        report = {
+            "summary": "read-only probe completed",
+            "files_changed": [],
+            "commands_run": ["Get-Date -Format o"],
+            "tests": [{"command": "Get-Date -Format o", "status": "passed", "details": "model said it passed"}],
+            "remaining_issues": [],
+        }
+        failed = CommandResult(
+            ["codex", "app-server", "--stdio"],
+            0,
+            "",
+            "",
+            {"app_server_tool_executions": [], "app_server_custom_tool_outputs": []},
+        )
+        self.assertIn(
+            "no completed successful tool execution",
+            _app_server_tool_attestation_error(report, failed),
+        )
+
+        passed = CommandResult(
+            ["codex", "app-server", "--stdio"],
+            0,
+            "",
+            "",
+            {
+                "app_server_tool_executions": [
+                    {"type": "commandExecution", "status": "completed", "exitCode": 0}
+                ]
+            },
+        )
+        self.assertEqual(_app_server_tool_attestation_error(report, passed), "")
 
     def test_request_validation_rejects_version_malformed_and_unknown_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

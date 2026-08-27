@@ -87,6 +87,7 @@ def _agent_for_account(account: Any) -> AgentConfig:
         label=account.label,
         backend=account.backend,
         service_tier=account.service_tier,
+        network_access=account.network_access,
     )
 
 

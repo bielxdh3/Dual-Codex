@@ -34,6 +34,7 @@ codex_home = "profiles/b"
 model = ""
 reasoning_effort = "medium"
 sandbox = "workspace-write"
+network_access = true
 """.strip(),
                 encoding="utf-8",
             )
@@ -43,6 +44,7 @@ sandbox = "workspace-write"
             self.assertEqual(config.max_correction_cycles, 2)
             self.assertEqual(config.architect.sandbox, "read-only")
             self.assertEqual(config.executor.sandbox, "workspace-write")
+            self.assertTrue(config.executor.network_access)
             self.assertEqual(config.live_event_journal_max_records, 9)
             self.assertEqual(config.live_event_journal_max_record_bytes, 2048)
             self.assertEqual(config.live_event_journal_max_detail_bytes, 512)
@@ -65,6 +67,26 @@ executor = "executor"
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ConfigError, "unsupported backend"):
+                load_config(root / "config.toml")
+
+    def test_rejects_non_boolean_network_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "config.toml").write_text(
+                """
+[orchestrator]
+repository = "repo"
+
+[accounts.executor]
+codex_home = "profile"
+network_access = "true"
+
+[roles]
+executor = "executor"
+""".strip(),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ConfigError, "network_access must be a boolean"):
                 load_config(root / "config.toml")
 
 

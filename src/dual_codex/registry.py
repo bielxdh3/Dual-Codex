@@ -95,6 +95,7 @@ def _registry_block(accounts: Mapping[str, AccountConfig], roles: Mapping[str, s
                 f"reasoning_effort = {_toml_string(account.reasoning_effort)}",
                 f"backend = {_toml_string(account.backend)}",
                 f"service_tier = {_toml_string(account.service_tier)}",
+                f"network_access = {'true' if account.network_access else 'false'}",
                 "",
             ]
         )
@@ -164,6 +165,7 @@ def _agent_for_status(account: AccountConfig):
         label=account.label,
         backend=account.backend,
         service_tier=account.service_tier,
+        network_access=account.network_access,
     )
 
 
@@ -240,6 +242,7 @@ def add_account(
         reasoning_effort=reasoning_effort.strip() or "high",
         backend="windows",
         service_tier="",
+        network_access=False,
     )
     output(f"Account: {account.name}")
     output(f"Label: {account.label or '(none)'}")
@@ -301,6 +304,7 @@ def rename_account(config: OrchestratorConfig, old_name: str, new_name: str) -> 
         reasoning_effort=old.reasoning_effort,
         backend=old.backend,
         service_tier=old.service_tier,
+        network_access=old.network_access,
     )
     roles = {
         role: new_name if account == old_name else account
@@ -325,6 +329,7 @@ def label_account(config: OrchestratorConfig, name: str, label: str) -> None:
         reasoning_effort=account.reasoning_effort,
         backend=account.backend,
         service_tier=account.service_tier,
+        network_access=account.network_access,
     )
     write_registry_config(config.config_path, accounts, config.roles)
 
@@ -399,6 +404,7 @@ def update_account_settings(
             if service_tier is None
             else validate_setting_value(service_tier, "service_tier")
         ),
+        network_access=account.network_access,
     )
     accounts = dict(config.accounts)
     accounts[name] = updated
@@ -553,6 +559,7 @@ def migrate_legacy_config(
             reasoning_effort=legacy_architect.reasoning_effort,
             backend=legacy_architect.backend,
             service_tier=legacy_architect.service_tier,
+            network_access=legacy_architect.network_access,
         ),
         executor_name: AccountConfig(
             name=executor_name,
@@ -562,6 +569,7 @@ def migrate_legacy_config(
             reasoning_effort=legacy_executor.reasoning_effort,
             backend=legacy_executor.backend,
             service_tier=legacy_executor.service_tier,
+            network_access=legacy_executor.network_access,
         ),
     }
     roles = {

@@ -54,6 +54,24 @@ class LiveEventTests(unittest.TestCase):
         )
         self.assertEqual((turn["kind"], turn["state"]), ("turn", "started"))
         self.assertEqual((turn["thread_id"], turn["turn_id"]), ("thread-1", "turn-1"))
+        command = normalize_notification(
+            "item/completed",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"type": "commandExecution", "status": "completed"},
+            },
+        )
+        self.assertEqual(command["kind"], "command_execution")
+        custom = normalize_notification(
+            "rawResponseItem/completed",
+            {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {"type": "custom_tool_call_output", "call_id": "call-1"},
+            },
+        )
+        self.assertEqual(custom["kind"], "custom_tool")
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

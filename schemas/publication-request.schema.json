@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["operation", "mission_id", "repository", "repository_full_name", "authorization", "authorization_reference"],
+  "properties": {
+    "operation": {"type": "string", "enum": ["normal_push", "create_branch", "draft_pr_create", "draft_pr_update"]},
+    "mission_id": {"type": "string", "minLength": 1},
+    "authorization_reference": {"type": "string", "minLength": 1},
+    "repository": {"type": "string", "minLength": 1},
+    "repository_full_name": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_actions"],
+      "properties": {
+        "allowed_actions": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}
+      }
+    },
+    "remote": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+    "branch": {"type": "string", "minLength": 1},
+    "expected_remote_old_sha": {"type": "string", "pattern": "^[a-fA-F0-9]{40,64}$"},
+    "expected_remote_state": {"type": "string", "enum": ["absent"]},
+    "new_sha": {"type": "string", "pattern": "^[a-fA-F0-9]{40,64}$"},
+    "expected_base_sha": {"type": "string", "pattern": "^[a-fA-F0-9]{40,64}$"},
+    "pr_number": {"type": "integer", "minimum": 1},
+    "expected_pr_head_sha": {"type": "string", "pattern": "^[a-fA-F0-9]{40,64}$"},
+    "expected_pr_state": {"const": "open"},
+    "expected_pr_draft": {"const": true},
+    "expected_pr_base": {"type": "string", "minLength": 1},
+    "title": {"type": "string", "maxLength": 256},
+    "body": {"type": "string", "maxLength": 100000},
+    "base_branch": {"type": "string", "minLength": 1},
+    "draft": {"const": true}
+  },
+  "oneOf": [
+    {
+      "properties": {"operation": {"const": "normal_push"}},
+      "required": ["branch", "expected_remote_old_sha", "new_sha"]
+    },
+    {
+      "properties": {"operation": {"const": "create_branch"}, "expected_remote_state": {"const": "absent"}},
+      "required": ["branch", "new_sha", "expected_remote_state"]
+    },
+    {
+      "properties": {"operation": {"const": "draft_pr_update"}},
+      "required": ["pr_number"],
+      "anyOf": [{"required": ["title"]}, {"required": ["body"]}]
+    },
+    {
+      "properties": {"operation": {"const": "draft_pr_create"}, "draft": {"const": true}},
+      "required": ["branch", "base_branch", "title"],
+      "additionalProperties": true
+    }
+  ]
+}

@@ -19,6 +19,7 @@ from dual_codex.cli import _VtKeyBuffer, _WindowsConsoleModes, _interactive_atta
 from dual_codex.paths import same_path
 from dual_codex.terminal import (
     TerminalError,
+    TerminalSetupRequiredError,
     TerminalSession,
     TerminalManager,
     TERMINAL_INLINE_MESSAGE_MAX,
@@ -68,6 +69,102 @@ def _normal_screen(prompt: str = "Improve documentation in @filename") -> str:
 
 
 class TerminalTests(unittest.TestCase):
+    def test_trust_prompt_is_a_typed_actionable_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            log_file = root / "session.pty.log"
+            config = _config(root, repository)
+            session = SimpleNamespace(
+                session_id="biel3-trust",
+                log_file=log_file,
+                pipe=r"\\.\pipe\dual-codex-biel3-trust",
+                codex_home=root / "codex-home",
+                repository=repository,
+            )
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            manager._load = lambda _session_id: session
+            manager.read = lambda _session_id, _lines: "Do you trust the contents of this directory?"
+            manager._terminal_health = lambda _session: "alive"
+
+            with self.assertRaises(TerminalSetupRequiredError) as raised:
+                manager.wait_until_ready("biel3-trust", timeout=0.1)
+
+            self.assertEqual(raised.exception.session_id, "biel3-trust")
+            self.assertTrue(raised.exception.diagnostics["seen_trust"])
+            self.assertNotIn("handshake unavailable", str(raised.exception).casefold())
+
+    def test_full_trust_dialog_is_setup_required_not_normal_composer(self) -> None:
+        detector = TuiReadinessDetector()
+        dialog = (
+            "> You are in C:\\Users\\bielx\\disposable-mission\n"
+            "Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.\n"
+            "Trusting the directory allows project-local config, hooks, and exec policies to load.\n"
+            "\u203a 1. Yes, continue\n"
+            "  2. No, quit\n"
+            "Press enter to continue and create a sandbox..."
+        )
+
+        self.assertEqual(detector.feed(dialog), detector.SETUP_REQUIRED)
+        self.assertTrue(detector.seen_trust)
+        self.assertTrue(detector.diagnostics()["seen_setup"])
+
+        ready = _normal_screen()
+        self.assertEqual(detector.feed(ready), detector.NOT_READY)
+        self.assertEqual(detector.feed(ready), detector.READY)
+
+    def test_stale_identity_confirmed_terminal_record_does_not_poison_ensure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            config = _config(root, repository)
+            sessions = config.runs_dir / "terminal-sessions"
+            sessions.mkdir(parents=True)
+            session = TerminalSession(
+                session_id="biel3-stale",
+                account="biel3",
+                label="Architect",
+                role="architect",
+                repository=repository,
+                codex_home=root / "profile",
+                pipe=r"\\.\pipe\dual-codex-biel3-stale-aaaaaaaaaaaaaaaa",
+                pid=123,
+                started_at="now",
+                log_file=sessions / "biel3-stale.pty.log",
+                process_start_identity="old-process",
+            )
+            record = sessions / "biel3-stale.json"
+            record.write_text(json.dumps(session.as_dict()), encoding="utf-8")
+            manager = TerminalManager.__new__(TerminalManager)
+            manager.config = config
+            manager.status = lambda _session_id: {"state": "unreachable"}
+
+            replacement = replace(session, state="ready", process_start_identity="new-process")
+            manager.start = lambda **_kwargs: replacement
+            with patch("dual_codex.terminal._process_start_identity", return_value=""), patch(
+                "dual_codex.terminal._process_is_alive", return_value=False
+            ):
+                result = manager.ensure(
+                    session_id=session.session_id,
+                    agent=AgentConfig(
+                        codex_home=session.codex_home,
+                        model="",
+                        reasoning_effort="high",
+                        sandbox="read-only",
+                        account_name="biel3",
+                        backend="windows",
+                    ),
+                    role="architect",
+                    repository=repository,
+                    add_dirs=(),
+                )
+
+            self.assertEqual(result.process_start_identity, "new-process")
+            self.assertFalse(record.exists())
+
     def test_interactive_command_is_not_exec_and_preserves_spaces(self) -> None:
         command = interactive_command_args(
             Path("C:/Work Tree/target"),

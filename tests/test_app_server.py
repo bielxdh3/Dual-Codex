@@ -12,15 +12,20 @@ from unittest.mock import Mock, patch
 from dual_codex.app_server import (
     AppServerError,
     _PROCESSES,
+    _app_server_command,
+    _mapping_path,
     _normalise_report,
     _process_key,
+    _save_thread_mapping,
     _sanitize_stderr,
+    _workspace_write_sandbox_policy,
     app_server_call,
     run_codex_app_server,
 )
 from dual_codex.codex import _report_from_message
 from dual_codex.config import AgentConfig, OrchestratorConfig
 from dual_codex.live_events import read_journal
+from dual_codex.process import executor_npm_cache
 
 
 class _FakeStdout:
@@ -61,6 +66,8 @@ class _FakeProcess:
         self.stdin = _FakeStdin(self)
         self.returncode = None
         self.prompts: list[str] = []
+        self.turn_params: list[dict] = []
+        self.thread_params: list[dict] = []
         self.thread_id = "thread-probe"
         self.turn_number = 0
 
@@ -98,6 +105,7 @@ class _FakeProcess:
                 }
             )
         elif method == "thread/start":
+            self.thread_params.append(message["params"])
             self._emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": self.thread_id}}})
         elif method == "thread/resume":
             self._emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": self.thread_id}}})
@@ -106,6 +114,7 @@ class _FakeProcess:
             turn_id = f"turn-{self.turn_number}"
             text = message["params"]["input"][0]["text"]
             self.prompts.append(text)
+            self.turn_params.append(message["params"])
             report = {
                 "summary": "probe",
                 "files_changed": ["probe.txt"],
@@ -144,6 +153,7 @@ class AppServerTests(unittest.TestCase):
             root = Path(temp)
             repository = root / "repo"
             repository.mkdir()
+            (repository / ".git").mkdir()
             config = _config(root)
             agent = AgentConfig(
                 codex_home=root / "profile",
@@ -155,6 +165,8 @@ class AppServerTests(unittest.TestCase):
                 backend="app_server",
             )
             fake_processes: list[_FakeProcess] = []
+            with patch.dict("os.environ", {"LOCALAPPDATA": str(root / "localappdata")}):
+                expected_cache = executor_npm_cache(agent)
 
             def create(*args, **kwargs):
                 fake = _FakeProcess(*args, **kwargs)
@@ -164,7 +176,14 @@ class AppServerTests(unittest.TestCase):
                 return fake
 
             long_prompt = "x" * 2201
-            with patch.dict("os.environ", {"OPENAI_API_KEY": "secret", "CODEX_API_KEY": "secret"}), patch(
+            with patch.dict(
+                "os.environ",
+                {
+                    "OPENAI_API_KEY": "secret",
+                    "CODEX_API_KEY": "secret",
+                    "LOCALAPPDATA": str(root / "localappdata"),
+                },
+            ), patch(
                 "dual_codex.app_server.subprocess.Popen", side_effect=create
             ):
                 first = run_codex_app_server(
@@ -197,6 +216,20 @@ class AppServerTests(unittest.TestCase):
             self.assertEqual(second.metadata["task_transport"], "app_server")
             self.assertEqual(len(fake_processes), 1)
             self.assertEqual(fake_processes[0].prompts, ["short", long_prompt])
+            self.assertEqual(
+                fake_processes[0].turn_params[0]["sandboxPolicy"],
+                {
+                    "type": "workspaceWrite",
+                    "networkAccess": False,
+                    "writableRoots": [
+                        str(repository),
+                        str(repository / ".git"),
+                        str(expected_cache),
+                    ],
+                },
+            )
+            self.assertTrue(fake_processes[0].thread_params[0].get("experimentalRawEvents"))
+            self.assertEqual(fake_processes[0].turn_params[0]["cwd"], str(repository))
             journal_path = Path(first.metadata["live_event_journal"])
             deadline = time.monotonic() + 1
             journal_events = read_journal(journal_path)
@@ -211,6 +244,70 @@ class AppServerTests(unittest.TestCase):
             self.assertTrue(all(event.thread_id == "thread-probe" for event in journal_events))
             self.assertTrue(all(event.turn_id in {"turn-1", "turn-2"} for event in journal_events))
 
+    def test_network_access_is_explicit_and_fail_closed(self) -> None:
+        repository = Path("C:/repo")
+        disabled = _workspace_write_sandbox_policy(repository)
+        enabled = _workspace_write_sandbox_policy(repository, network_access=True)
+        self.assertFalse(disabled["networkAccess"])
+        self.assertTrue(enabled["networkAccess"])
+
+    def test_headless_app_server_forces_unelevated_windows_sandbox(self) -> None:
+        command = _app_server_command(_config(Path("C:/dual-codex-test")))
+        self.assertIn("-c", command)
+        self.assertIn('windows.sandbox="unelevated"', command)
+
+    def test_process_key_is_scoped_to_repository(self) -> None:
+        config = _config(Path("C:/dual-codex-test"))
+        agent = AgentConfig(
+            codex_home=Path("C:/profile"),
+            model="",
+            reasoning_effort="high",
+            sandbox="workspace-write",
+            account_name="executor",
+            backend="app_server",
+        )
+        self.assertNotEqual(
+            _process_key(agent, config, Path("C:/repo-a")),
+            _process_key(agent, config, Path("C:/repo-b")),
+        )
+
+    def test_network_enabled_executor_turn_receives_scoped_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            repository = root / "repo"
+            repository.mkdir()
+            (repository / ".git").mkdir()
+            agent = AgentConfig(
+                codex_home=root / "profile",
+                model="",
+                reasoning_effort="high",
+                sandbox="workspace-write",
+                account_name="biel4",
+                backend="app_server",
+                network_access=True,
+            )
+            fake = _FakeProcess()
+            with patch.dict("os.environ", {"LOCALAPPDATA": str(root / "localappdata")}):
+                expected_cache = executor_npm_cache(agent)
+                with patch("dual_codex.app_server.subprocess.Popen", return_value=fake):
+                    result = run_codex_app_server(
+                        config=_config(root),
+                        agent=agent,
+                        repository=repository,
+                        prompt="network probe",
+                        output_path=root / "result.json",
+                        session_id="network-session",
+                    )
+            self.assertEqual(result.returncode, 0)
+            policy = fake.turn_params[0]["sandboxPolicy"]
+            self.assertTrue(policy["networkAccess"])
+            self.assertEqual(policy["writableRoots"][:2], [str(repository), str(repository / ".git")])
+            self.assertEqual(policy["writableRoots"][2], str(expected_cache))
+            for process in list(_PROCESSES.values()):
+                process.close()
+            _PROCESSES.clear()
+            time.sleep(0.1)
+
     def test_server_requests_are_denied_without_escalation(self) -> None:
         # The real probe used approvalPolicy=never and emitted no requests. This
         # unit seam is covered by the implementation's explicit decline branch.
@@ -221,6 +318,46 @@ class AppServerTests(unittest.TestCase):
         process._send = sent.append
         process._respond_to_server_request({"id": 7, "method": "item/commandExecution/requestApproval"})
         self.assertEqual(sent[0]["result"], {"decision": "decline"})
+
+    def test_dynamic_tool_request_returns_structured_custom_output(self) -> None:
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        sent: list[dict] = []
+        process._send = sent.append
+        process._respond_to_server_request(
+            {
+                "id": 8,
+                "method": "item/tool/call",
+                "params": {"tool": "probe", "callId": "call-1"},
+            }
+        )
+        self.assertEqual(sent[0]["result"]["success"], False)
+        self.assertEqual(sent[0]["result"]["contentItems"][0]["type"], "inputText")
+        self.assertIn("headless Dual Codex App Server", sent[0]["result"]["contentItems"][0]["text"])
+
+    def test_raw_custom_tool_output_is_bounded_to_reconciliation_fields(self) -> None:
+        from dual_codex.app_server import _raw_response_item_evidence
+
+        evidence = _raw_response_item_evidence(
+            {
+                "type": "custom_tool_call_output",
+                "id": "ctco-1",
+                "call_id": "call-1",
+                "name": "exec",
+                "input": "do not retain this input",
+                "encrypted_content": "do not retain reasoning",
+                "output": [
+                    {"type": "input_text", "text": "Exit code: 0\\nOutput: ok"},
+                ],
+            }
+        )
+        self.assertEqual(evidence["type"], "custom_tool_call_output")
+        self.assertEqual(evidence["call_id"], "call-1")
+        self.assertEqual(evidence["output"][0]["text"], r"Exit code: 0\nOutput: ok")
+        self.assertTrue(evidence["success"])
+        self.assertNotIn("input", evidence)
+        self.assertNotIn("encrypted_content", evidence)
 
     def test_event_journal_failure_cannot_change_notification_handling(self) -> None:
         from collections import deque
@@ -359,6 +496,21 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(response["id"], 1)
         self.assertEqual(process._next_message.call_count, 2)
 
+    def test_process_exit_preserves_sanitized_stderr_diagnostic(self) -> None:
+        from collections import deque
+        from dual_codex.app_server import _AppServerProcess
+
+        process = object.__new__(_AppServerProcess)
+        process._messages = queue.Queue()
+        process._messages.put(None)
+        process._stderr = deque(['state=auth.json token="secret-value"'])
+
+        with self.assertRaisesRegex(AppServerError, "process exited unexpectedly") as raised:
+            process._next_message(0.1)
+
+        self.assertIn("[REDACTED_AUTH_PATH]", str(raised.exception))
+        self.assertNotIn("secret-value", str(raised.exception))
+
     def test_report_normalisation_keeps_existing_delegation_shape(self) -> None:
         value = json.loads(
             _normalise_report(
@@ -432,9 +584,11 @@ class AppServerTests(unittest.TestCase):
             process = object.__new__(type("Process", (), {}))
             process.agent = agent
             process.config = config
+            process.repository = repository
             process.thread_id_for = Mock(side_effect=AppServerError("turn timed out"))
             process.close = Mock()
-            key = _process_key(agent, config)
+            _save_thread_mapping(config, agent, repository, "stale-thread")
+            key = _process_key(agent, config, repository)
             _PROCESSES[key] = process
             with patch("dual_codex.app_server._get_process", return_value=process):
                 result = run_codex_app_server(
@@ -447,6 +601,7 @@ class AppServerTests(unittest.TestCase):
                 )
             self.assertEqual(result.returncode, 1)
             self.assertNotIn(key, _PROCESSES)
+            self.assertFalse(_mapping_path(config, agent, repository).exists())
             process.close.assert_called_once_with()
 
 

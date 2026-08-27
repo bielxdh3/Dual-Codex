@@ -27,6 +27,7 @@ class AccountConfig:
     reasoning_effort: str
     backend: str = "windows"
     service_tier: str = ""
+    network_access: bool = False
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class AgentConfig:
     label: str = ""
     backend: str = "windows"
     service_tier: str = ""
+    network_access: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,7 @@ class OrchestratorConfig:
             label=account.label,
             backend=account.backend,
             service_tier=account.service_tier,
+            network_access=account.network_access,
         )
 
 
@@ -146,6 +149,9 @@ def _account(name: str, raw: dict[str, Any], base: Path) -> AccountConfig:
             f"Account '{name}' has unsupported backend '{backend}'. "
             f"Supported backends: {', '.join(SUPPORTED_BACKENDS)}."
         )
+    network_access = raw.get("network_access", False)
+    if not isinstance(network_access, bool):
+        raise ConfigError(f"Account '{name}' network_access must be a boolean.")
     return AccountConfig(
         name=validate_account_name(name),
         label=str(raw.get("label", "")).strip(),
@@ -154,6 +160,7 @@ def _account(name: str, raw: dict[str, Any], base: Path) -> AccountConfig:
         reasoning_effort=validate_setting_value(raw.get("reasoning_effort", "high"), "reasoning_effort") or "high",
         backend=backend,
         service_tier=validate_setting_value(raw.get("service_tier", ""), "service_tier"),
+        network_access=network_access,
     )
 
 

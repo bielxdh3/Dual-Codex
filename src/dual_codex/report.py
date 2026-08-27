@@ -11,6 +11,120 @@ EXECUTOR_REPORT_FIELDS = frozenset(
     {"summary", "files_changed", "commands_run", "tests", "remaining_issues"}
 )
 EXECUTOR_REPORT_REQUIRED_WITHOUT_TELEMETRY = EXECUTOR_REPORT_FIELDS - {"commands_run"}
+_EXTENDED_REPORT_FIELDS = frozenset(
+    {
+        "summary",
+        "status",
+        "starting_sha",
+        "final_sha",
+        "files_changed",
+        "behavior_changed",
+        "validations_run",
+        "validations_not_run",
+        "remaining_limitations",
+        "next_plan_tree_item",
+        "commands_run",
+        "tests",
+        "remaining_issues",
+        "push_result",
+        "remote_result",
+        "pr_result",
+    }
+)
+
+
+def _string_list(value: Any) -> list[str] | None:
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        return None
+    return list(value)
+
+
+def _test_list(value: Any, *, status: str) -> list[dict[str, str]] | None:
+    if not isinstance(value, list):
+        return None
+    result: list[dict[str, str]] = []
+    for item in value:
+        if isinstance(item, str):
+            result.append({"command": item, "status": status, "details": "reported by Executor"})
+            continue
+        if not isinstance(item, Mapping) or set(item) != {"command", "status", "details"}:
+            return None
+        if not all(isinstance(item[field], str) for field in ("command", "status", "details")):
+            return None
+        if item["status"] not in {"passed", "failed", "not_run"}:
+            return None
+        result.append({field: item[field] for field in ("command", "status", "details")})
+    return result
+
+
+def _normalise_extended_report(value: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Adapt the known richer Executor result to the one canonical report shape."""
+
+    if not set(value).issubset(_EXTENDED_REPORT_FIELDS):
+        return None
+    if not isinstance(value.get("status"), str) or not value["status"].strip():
+        return None
+    for field in (
+        "starting_sha",
+        "final_sha",
+        "behavior_changed",
+        "next_plan_tree_item",
+        "summary",
+        "push_result",
+        "remote_result",
+        "pr_result",
+    ):
+        if field in value and not isinstance(value[field], str):
+            return None
+    if not any(
+        field in value
+        for field in (
+            "starting_sha",
+            "final_sha",
+            "behavior_changed",
+            "validations_run",
+            "validations_not_run",
+            "remaining_limitations",
+            "push_result",
+            "remote_result",
+            "pr_result",
+        )
+    ):
+        return None
+    files_changed = _string_list(value.get("files_changed"))
+    commands_run = _string_list(value.get("commands_run", []))
+    if files_changed is None or commands_run is None:
+        return None
+    validations_run = _test_list(value.get("validations_run", []), status="passed")
+    validations_not_run = _test_list(value.get("validations_not_run", []), status="not_run")
+    limitations = _string_list(value.get("remaining_limitations", []))
+    remaining_issues = _string_list(value.get("remaining_issues", []))
+    if validations_run is None or validations_not_run is None or limitations is None or remaining_issues is None:
+        return None
+    tests = _test_list(value.get("tests", []), status="passed")
+    if tests is None:
+        return None
+    summary = value.get("summary")
+    if summary is None:
+        status = value["status"]
+        behavior = value.get("behavior_changed", "")
+        summary = f"{status}: {behavior}".rstrip(": ")
+    if not isinstance(summary, str):
+        return None
+    remaining_issues.extend(limitations)
+    for field in ("push_result", "remote_result", "pr_result"):
+        result = value.get(field)
+        if result is not None and not isinstance(result, str):
+            return None
+        if result and result.casefold() not in {"passed", "completed", "updated", "not attempted", "not checked", "not updated"}:
+            remaining_issues.append(f"{field}: {result}")
+    return {
+        "summary": summary,
+        "files_changed": files_changed,
+        "commands_run": commands_run,
+        "tests": [*tests, *validations_run, *validations_not_run],
+        "remaining_issues": remaining_issues,
+    }
 
 
 def normalise_executor_report(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -27,6 +141,9 @@ def normalise_executor_report(value: Mapping[str, Any]) -> dict[str, Any]:
         and "commands_run" not in normalised
     ):
         normalised["commands_run"] = []
+    extended = _normalise_extended_report(normalised)
+    if extended is not None:
+        return extended
     return normalised
 
 
