@@ -10,6 +10,9 @@ permissions:
 jobs:
   unit-tests:
     runs-on: windows-latest
+    env:
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
     strategy:
       fail-fast: false
       matrix:
