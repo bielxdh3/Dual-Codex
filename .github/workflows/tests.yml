@@ -10,9 +10,6 @@ permissions:
 jobs:
   unit-tests:
     runs-on: windows-latest
-    env:
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +20,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
+
+      - name: Normalize Windows temp path
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
 
       - name: Set up Python
         uses: actions/setup-python@v5
