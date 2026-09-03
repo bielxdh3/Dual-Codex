@@ -425,18 +425,34 @@ def _thread_lock(path: Path) -> threading.RLock:
         return _THREAD_LOCKS.setdefault(key, threading.RLock())
 
 
+def _open_journal_lock(lock_path: Path) -> Any:
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            lock_path.touch(exist_ok=True)
+            handle = lock_path.open("r+b")
+            try:
+                if handle.seek(0, os.SEEK_END) == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                return handle
+            except Exception:
+                handle.close()
+                raise
+        except OSError:
+            if os.name != "nt" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 @contextmanager
 def _journal_lock(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + ".lock")
     lock = _thread_lock(lock_path)
     with lock:
-        lock_path.touch(exist_ok=True)
-        with lock_path.open("r+b") as handle:
-            if handle.seek(0, os.SEEK_END) == 0:
-                handle.write(b"\0")
-                handle.flush()
-            handle.seek(0)
+        with _open_journal_lock(lock_path) as handle:
             if os.name == "nt":
                 import msvcrt
 
