@@ -21,6 +21,12 @@ jobs:
         with:
           fetch-depth: 2
 
+      - name: Normalize Windows temp path
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
